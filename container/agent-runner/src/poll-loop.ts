@@ -43,6 +43,19 @@ export function isCorruptionError(msg: string): boolean {
   );
 }
 
+/**
+ * True when the Claude Code subprocess was terminated by a signal rather than
+ * failing on its own — code 137 (128+SIGKILL) or 143 (128+SIGTERM). This is
+ * what the SDK surfaces when host-sweep reaps the container (idle-heartbeat
+ * ceiling or stale-claim kill; see src/host-sweep.ts), not an agent error.
+ * Delivering it to the user as "Error: ..." is noise — the turn either already
+ * completed (idle reap) or its messages stay pending and the next wake
+ * reprocesses them. Caller suppresses the user-facing delivery.
+ */
+export function isHostKillExit(msg: string): boolean {
+  return /process exited with code (137|143)\b/.test(msg);
+}
+
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -255,6 +268,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
+
+      // Host-initiated container reap (SIGKILL/SIGTERM → exit 137/143). Not an
+      // agent failure: don't deliver a scary "Error: ..." to the user. Return
+      // without markCompleted so a mid-turn kill leaves the batch pending for
+      // the next wake to reprocess; an idle reap already marked the batch
+      // completed when its result event fired, so nothing is re-answered.
+      if (isHostKillExit(errMsg)) {
+        log('Container reaped by host (signal kill) — suppressing error delivery, leaving batch for next wake');
+        return;
+      }
 
       // Stale/corrupt continuation recovery: ask the provider whether
       // this error means the stored continuation is unusable, and clear
