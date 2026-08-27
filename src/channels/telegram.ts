@@ -195,17 +195,25 @@ function createPairingInterceptor(
   };
 }
 
-registerChannelAdapter('telegram', {
-  factory: () => {
-    const env = readEnvFile(['TELEGRAM_BOT_TOKEN']);
-    if (!env.TELEGRAM_BOT_TOKEN) return null;
-    const token = env.TELEGRAM_BOT_TOKEN;
+/**
+ * Build a Telegram adapter factory for one bot. `tokenEnvKey` selects the
+ * `.env` token; `instance` names the adapter instance (undefined = the legacy
+ * default instance, which keeps its unprefixed state namespace). Each call
+ * registers an independent polling bot with its own token, state, and routing
+ * key, so N Telegram bots coexist — one per agent group.
+ */
+function createTelegramFactory(tokenEnvKey: string, instance?: string): () => ChannelAdapter | null {
+  return () => {
+    const env = readEnvFile([tokenEnvKey]);
+    const token = env[tokenEnvKey];
+    if (!token) return null;
     const telegramAdapter = createTelegramAdapter({
       botToken: token,
       mode: 'polling',
     });
     const bridge = createChatSdkBridge({
       adapter: telegramAdapter,
+      instance,
       concurrency: 'concurrent',
       extractReplyContext,
       supportsThreads: false,
@@ -241,5 +249,14 @@ registerChannelAdapter('telegram', {
       },
     };
     return wrapped;
-  },
+  };
+}
+
+// Primary bot (nano_qrl_bot) — legacy default instance, unprefixed state.
+registerChannelAdapter('telegram', { factory: createTelegramFactory('TELEGRAM_BOT_TOKEN') });
+
+// Second bot (@dms_pa_media_bot) → DMS PA Media agent group. Independent token +
+// instance; only starts when TELEGRAM_BOT_TOKEN_DMSPA is set in .env.
+registerChannelAdapter('telegram-dmspa', {
+  factory: createTelegramFactory('TELEGRAM_BOT_TOKEN_DMSPA', 'telegram-dmspa'),
 });
