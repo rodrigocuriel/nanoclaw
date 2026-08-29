@@ -5,7 +5,7 @@
  */
 import { createTelegramAdapter } from '@chat-adapter/telegram';
 
-import { readEnvFile } from '../env.js';
+import { readEnvFile, readEnvMatching } from '../env.js';
 import { log } from '../log.js';
 import { createMessagingGroup, getMessagingGroupByPlatform, updateMessagingGroup } from '../db/messaging-groups.js';
 import { grantRole, hasAnyOwner } from '../modules/permissions/db/user-roles.js';
@@ -255,8 +255,17 @@ function createTelegramFactory(tokenEnvKey: string, instance?: string): () => Ch
 // Primary bot (nano_qrl_bot) — legacy default instance, unprefixed state.
 registerChannelAdapter('telegram', { factory: createTelegramFactory('TELEGRAM_BOT_TOKEN') });
 
-// Second bot (@dms_pa_media_bot) → DMS PA Media agent group. Independent token +
-// instance; only starts when TELEGRAM_BOT_TOKEN_DMSPA is set in .env.
-registerChannelAdapter('telegram-dmspa', {
-  factory: createTelegramFactory('TELEGRAM_BOT_TOKEN_DMSPA', 'telegram-dmspa'),
-});
+// Additional bots: one adapter per TELEGRAM_BOT_TOKEN_<NAME> in .env, registered
+// as instance `telegram-<name>` (e.g. TELEGRAM_BOT_TOKEN_DMSPA → telegram-dmspa).
+// Each is an independent polling bot with its own token, state, and routing key,
+// wired to its own agent group. Adding a bot is pure config — add the token here
+// plus the messaging group / wiring / channel destination; no code change.
+for (const tokenEnvKey of Object.keys(readEnvMatching('TELEGRAM_BOT_TOKEN_'))) {
+  const suffix = tokenEnvKey
+    .slice('TELEGRAM_BOT_TOKEN_'.length)
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]/g, '-');
+  if (!suffix) continue;
+  const instance = `telegram-${suffix}`;
+  registerChannelAdapter(instance, { factory: createTelegramFactory(tokenEnvKey, instance) });
+}
