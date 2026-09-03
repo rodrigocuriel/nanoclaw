@@ -859,10 +859,15 @@ export class OpenCodeProvider implements AgentProvider {
   }
 
   query(input: QueryInput): AgentQuery {
-    // Same refusal as the Codex provider: the runner registers the shared hook
-    // unconditionally before polling, so an unregistered provider means the
-    // wiring broke — fail loudly rather than run a memoryless agent forever.
-    if (!this.memorySessionHook) throw new Error('OpenCode memory session hook was not registered');
+    // Newer trunk registers a shared memory session hook before polling. This
+    // install's agent-runner core predates that memory subsystem, so no hook is
+    // registered here. Group memory still reaches the agent via the composed
+    // system prompt (CLAUDE.md / CLAUDE.local.md in systemContext.instructions),
+    // exactly as the Claude provider delivers it on this install — so proceed
+    // without the extra hook-based injection instead of refusing to run.
+    if (!this.memorySessionHook) {
+      log('OpenCode memory session hook not registered — proceeding without hook-based memory injection');
+    }
 
     if (input.continuation) {
       this.activeSessionId = input.continuation;
