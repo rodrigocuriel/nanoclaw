@@ -18,7 +18,6 @@ const PASSTHROUGH_KEYS = [
   'OPENCODE_PROVIDER',
   'OPENCODE_MODEL',
   'OPENCODE_SMALL_MODEL',
-  'ANTHROPIC_BASE_URL',
   'OPENCODE_MODEL_CONTEXT_LIMIT',
   'OPENCODE_MODEL_OUTPUT_LIMIT',
   'OPENCODE_MODEL_INPUT_MODALITIES',
@@ -53,11 +52,23 @@ registerProviderContainerConfig('opencode', (ctx) => {
   // EnvironmentFile — so under launchd/systemd, ctx.hostEnv carries none of
   // these. Fall back to the `.env` file the way the claude provider does;
   // a real exported variable still wins over the file.
-  const dotenv = readEnvFile([...PASSTHROUGH_KEYS]);
+  const dotenv = readEnvFile([...PASSTHROUGH_KEYS, 'OPENCODE_BASE_URL', 'ANTHROPIC_BASE_URL']);
   for (const key of PASSTHROUGH_KEYS) {
     const value = ctx.hostEnv[key] ?? dotenv[key];
     if (value) env[key] = value;
   }
+
+  // OpenCode's upstream base URL. Sourced from OPENCODE_BASE_URL so it no longer
+  // shares ANTHROPIC_BASE_URL with the Claude provider (which must default to
+  // api.anthropic.com for native OAuth). Falls back to the legacy ANTHROPIC_BASE_URL
+  // for compatibility. Passed into the container as ANTHROPIC_BASE_URL, which the
+  // in-container OpenCode provider reads as its baseURL.
+  const opencodeBaseUrl =
+    ctx.hostEnv.OPENCODE_BASE_URL ??
+    dotenv.OPENCODE_BASE_URL ??
+    ctx.hostEnv.ANTHROPIC_BASE_URL ??
+    dotenv.ANTHROPIC_BASE_URL;
+  if (opencodeBaseUrl) env.ANTHROPIC_BASE_URL = opencodeBaseUrl;
 
   return {
     mounts: [{ hostPath: opencodeDir, containerPath: '/opencode-xdg', readonly: false }],

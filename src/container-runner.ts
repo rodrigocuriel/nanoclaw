@@ -20,6 +20,7 @@ import {
   TIMEZONE,
 } from './config.js';
 import { materializeContainerJson } from './container-config.js';
+import { nativeCredentialEnvArgs } from './native-credential-proxy.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars } from './db/container-configs.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
@@ -488,6 +489,13 @@ async function buildContainerArgs(
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }
   log.info('OneCLI gateway applied', { containerName });
+
+  // Native Anthropic OAuth (hybrid): inject the real subscription OAuth token
+  // + NO_PROXY LAST — after the gateway — so it overrides the placeholder
+  // CLAUDE_CODE_OAUTH_TOKEN the gateway sets and routes api.anthropic.com
+  // around the gateway. No-op unless NANOCLAW_NATIVE_CREDENTIALS=true. See
+  // native-credential-proxy.ts.
+  args.push(...nativeCredentialEnvArgs());
 
   // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).
   args.push('--entrypoint', 'bash');
