@@ -105,3 +105,19 @@ export function parseZonedToUtc(input: string, tz: string): Date {
   const offsetMs = zonedAsUtcMs - asIfUtc.getTime();
   return new Date(asIfUtc.getTime() - offsetMs);
 }
+
+/**
+ * ISO-like local timestamp (YYYY-MM-DD HH:mm:ss) via sv-SE locale. Ported from
+ * trunk for the Codex provider's exchange-archive; takes a Date (not an ISO string).
+ */
+export function formatLocalStamp(date: Date, timezone: string): string {
+  return date.toLocaleString('sv-SE', {
+    timeZone: resolveTimezone(timezone),
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
