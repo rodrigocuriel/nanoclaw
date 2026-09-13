@@ -20,6 +20,41 @@ function createCodexProvider(...args: ConstructorParameters<typeof CodexProvider
 }
 
 describe('CodexProvider active turns', () => {
+  it('keeps a reconnecting turn alive and delivers the recovered answer', async () => {
+    const fake = createFakeCodexRuntime();
+    const query = createCodexProvider({}, fake.runtime).query({ prompt: 'prompt', cwd: '/workspace/agent' });
+    const events: ProviderEvent[] = [];
+    const collect = collectEvents(query.events, events);
+    await waitFor(() => fake.startCalls.length === 1);
+    fake.notifyError('Reconnecting... 2/5', true);
+    await sleep(0);
+    expect(fake.killed).toBe(false);
+    query.push('follow-up during reconnect');
+    await waitFor(() => fake.steerCalls.length === 1);
+    query.end();
+    fake.completeTurn('recovered answer');
+    await collect;
+    expect(events.filter((event) => event.type === 'error')).toEqual([]);
+    expect(events.filter((event) => event.type === 'result')).toEqual([{ type: 'result', text: 'recovered answer' }]);
+    expect(events).toContainEqual({ type: 'progress', message: 'Reconnecting... 2/5' });
+  });
+
+  it('still fails when Codex exhausts its retries', async () => {
+    const fake = createFakeCodexRuntime();
+    const query = createCodexProvider({}, fake.runtime).query({ prompt: 'prompt', cwd: '/workspace/agent' });
+    const events: ProviderEvent[] = [];
+    const collect = collectEvents(query.events, events);
+    const failure = collect.catch((error: Error) => error);
+    await waitFor(() => fake.startCalls.length === 1);
+    fake.notifyError('Reconnecting... 2/5', true);
+    await sleep(0);
+    fake.notifyError('Retries exhausted', false);
+    expect((await failure)?.message).toBe('Retries exhausted');
+    expect(events.filter((event) => event.type === 'error')).toHaveLength(1);
+    expect(events.some((event) => event.type === 'result')).toBe(false);
+    expect(fake.killed).toBe(true);
+  });
+
   it('steers follow-ups into the active turn and yields liveness activity', async () => {
     const fake = createFakeCodexRuntime();
     const provider = createCodexProvider({}, fake.runtime);
@@ -237,6 +272,9 @@ function createFakeCodexRuntime(opts: { rejectSteer?: boolean } = {}) {
     startCalls,
     steerCalls,
     interruptCalls,
+    notifyError(message: string, willRetry: boolean) {
+      notify('error', { error: { message }, willRetry, threadId: 'thread-1', turnId: 'turn-1' });
+    },
     get killed() {
       return killed;
     },

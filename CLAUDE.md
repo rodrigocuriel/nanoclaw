@@ -314,3 +314,7 @@ launchctl kickstart -k gui/$(id -u)/com.nanoclaw   # macOS
 ```
 
 `container/build.sh` reads `INSTALL_CJK_FONTS` from `.env` and passes it through as a Docker build-arg. Without CJK fonts, Chromium-rendered screenshots and PDFs containing CJK text show tofu (empty rectangles) instead of characters.
+
+## Live specialist operations
+
+Before creating or troubleshooting coordinator/specialist agents, read [docs/specialist-operations.md](docs/specialist-operations.md). It records the live deployment location, Codex vault authentication, required proxy exclusions, bidirectional destination ACLs, retry handling, and validation using actual containers. See [DEPLOYMENT.local.md](DEPLOYMENT.local.md) for this installation's change history.

@@ -33,7 +33,7 @@ export const NATIVE_CREDENTIALS_FLAG = 'NANOCLAW_NATIVE_CREDENTIALS';
 const CREDENTIAL_VARS = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY'] as const;
 
 /** Hosts the container should reach directly, bypassing the OneCLI gateway. */
-const NO_PROXY_VALUE = 'api.anthropic.com,chatgpt.com,api.openai.com,127.0.0.1,localhost';
+const NO_PROXY_VALUE = 'api.anthropic.com,127.0.0.1,localhost';
 
 export function nativeCredentialsEnabled(): boolean {
   // The host (launchd/systemd) does not load .env into process.env — the

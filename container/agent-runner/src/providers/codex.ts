@@ -34,7 +34,7 @@ import {
   writeCodexConfigToml,
 } from './codex-app-server.js';
 
-const TURN_TIMEOUT_MS = 10 * 60 * 1000;
+import { createTurnWatchdog } from './turn-watchdog.js';
 
 export interface CodexRuntimeDeps {
   writeCodexConfigToml: typeof writeCodexConfigToml;
@@ -287,6 +287,7 @@ async function* runOneTurn(
   // pushOrSteer queues any racing follow-up into a fresh turn instead.
   const finishTurn = (): void => {
     turnDone = true;
+    watchdog.stop();
     clearActiveTurn();
   };
 
@@ -298,9 +299,16 @@ async function* runOneTurn(
   };
   setAbortWaker(kick);
 
+  const watchdog = createTurnWatchdog((reason) => {
+    state.error = new Error(reason);
+    finishTurn();
+    kick();
+  });
+
   const handler = (n: JsonRpcNotification): void => {
     const method = n.method;
     const params = n.params ?? {};
+    watchdog.touch();
     buffer.push({ type: 'activity' });
 
     switch (method) {
@@ -338,6 +346,12 @@ async function* runOneTurn(
       case 'error': {
         const err = params.error as { message?: string; additionalDetails?: string | null } | undefined;
         const msg = [err?.message, err?.additionalDetails].filter(Boolean).join(': ') || 'Codex turn failed';
+        // Codex owns transport retries; keep the turn alive until recovery or
+        // a terminal error instead of killing the app-server mid-reconnect.
+        if (params.willRetry === true) {
+          buffer.push({ type: 'progress', message: msg });
+          break;
+        }
         state.error = new Error(msg);
         finishTurn();
         break;
@@ -376,12 +390,6 @@ async function* runOneTurn(
     kick();
   };
   server.exitHandlers.push(onServerExit);
-
-  const timer = setTimeout(() => {
-    state.error = new Error(`Turn timed out after ${TURN_TIMEOUT_MS}ms`);
-    finishTurn();
-    kick();
-  }, TURN_TIMEOUT_MS);
 
   try {
     if (!hasInit()) {
@@ -433,7 +441,7 @@ async function* runOneTurn(
 
     yield { type: 'result', text: resultText || null };
   } finally {
-    clearTimeout(timer);
+    watchdog.stop();
     clearActiveTurn();
     setAbortWaker(null);
     const idx = server.notificationHandlers.indexOf(handler);
