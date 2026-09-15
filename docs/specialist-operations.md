@@ -75,7 +75,7 @@ The container typecheck was attempted and has pre-existing errors involving MCP 
 | Model requires a newer Codex | Check `codex --version` inside the actual container, the manifest pin, and the image used at spawn |
 | Missing authentication headers, requests to `api.openai.com` | Check for an empty/missing `auth.json`, missing vault OpenAI secret, and absent credential stub |
 | `Reconnecting... 2/5` immediately ends the turn | Ensure the Codex provider honors the protocol's `willRetry` flag |
-| 401 followed by `Read-only file system (os error 30)` | Inspect final `NO_PROXY`/`no_proxy`; in this incident placeholders bypassed injection and Codex tried to refresh the deliberately read-only auth stub |
+| 401 followed by `Read-only file system (os error 30)` | Inspect final `NO_PROXY`/`no_proxy` and the preceding auth error. Proxy bypass caused the September 11 incident; `token_revoked` caused the September 15 incident. See credential renewal below. |
 | Unknown destination | Check the source agent's named destination ACL and its projection into the session DB |
 
 The read-only auth stub is intentional. The containing `.codex` state directory must be writable by the container's `node` user. For isolated test containers, Docker can create a missing parent directory as root-owned: provision a writable temporary Codex state directory before mounting the nested stub. Run SDK container configuration as the `nanoclaw` service user to avoid ownership conflicts with its existing temporary CA files.
@@ -96,3 +96,28 @@ UIUX (`ag-1789247532765-juid5k`) was already registered, with Maven → `uiux` a
 Validated the complete exchange: Maven sent a connectivity check to `uiux`; UIUX authenticated and returned `UIUX_READY`; Maven acknowledged connectivity. No duplicate agent was created. The evidence supports stale conversational/runtime awareness, not a missing central route or an authentication failure.
 
 Operational gotcha: `groups restart --message` only processes currently running containers. For an idle UIUX session it returned `restarted: 0` and queued no message. The bounded check was queued using the existing host `writeSessionMessage` helper as the service user and picked up by the normal host sweep. Verify a message was actually queued and a reply delivered; a successful CLI exit alone does not establish this.
+
+## Codex credential renewal after `token_revoked` (2026-09-15)
+
+### Recognize the failure
+
+Cardi (`DMS PA Media`) returned `Error: Read-only file system (os error 30)`. Its live container logs first showed HTTP 401 with `Encountered invalidated oauth token for user` and code `token_revoked`, then repeated read-only errors. Codex attempted credential refresh against `/home/node/.codex/auth.json`, which is deliberately mounted read-only by OneCLI. The host root filesystem, agent workspace, and containing `.codex` directory were writable; the proxy exclusions were correct. Other Codex containers also logged revoked-token errors, although some continued producing results.
+
+The vault credential originated from the operator's Mac Codex login imported on September 11. The logs establish revocation, but do not establish why it happened. Do not assume every read-only error has this cause: inspect the preceding error and actual mounts first. Making the auth stub writable or restarting alone does not repair a revoked vault credential.
+
+### Replace the credential
+
+1. Have the operator provide a freshly authenticated Codex auth JSON file on the production host. In this incident the supplied file was `/tmp/codex-auth.json` on **curielmedia**, not on the local Mac. Handle the file directly; never print its contents or paste credentials into chat, command arguments, or documentation. Restrict its permissions to `0600`.
+2. Validate in memory that `tokens.access_token`, `tokens.refresh_token`, and `tokens.id_token` are nonempty strings. Preserve the complete auth JSON, including its account information.
+3. Find the existing secret through the loopback OneCLI management API: `GET http://127.0.0.1:10254/api/secrets`. Display only metadata such as ID, name, type, and host pattern. The existing entry was named `Codex`, type `openai`, host pattern `chatgpt.com`. Resolve its ID afresh rather than creating a duplicate.
+4. Update that entry with `PATCH http://127.0.0.1:10254/api/secrets/<secret-id>`. The JSON request has a `value` field containing the **serialized complete auth JSON as a string**. Build and send the body in memory from the file, using a host HTTP client. The installed gateway accepted this with HTTP 200 and parsed it as OpenAI OAuth. Keeping the same secret ID preserves agent assignments. Read back metadata to confirm the name, type, and host pattern remain correct; do not log the request body or credential-bearing responses.
+5. The `onecli` executable was absent from the production host's PATH during this incident; the loopback API worked. If the API changes, inspect the installed gateway's supported update route before proceeding. No direct vault database edit, SDK installation, image rebuild, or host build was needed.
+
+### Verify and restart
+
+- Test from actual running Codex containers through their existing OneCLI proxy. Read the mounted auth stub in memory, send its access token as `Authorization: Bearer ...` and its account ID as `ChatGPT-Account-Id` when present. Request `https://chatgpt.com/backend-api/codex/models?client_version=0.153.0` (use the installed CLI version for future checks). Bun is available; Python was absent inside these containers. With Bun `fetch`, explicitly set `proxy` from `HTTPS_PROXY` or `https_proxy`, retain the configured CA trust, and print only the HTTP status.
+- Cardi, Maven, and Amp were the three active NanoClaw containers at verification time. Each returned HTTP 200 after the vault update. This verifies gateway injection and models-endpoint authentication; it is not an end-to-end conversational test or proof that every dormant agent was tested.
+- From the live project, use `node --import tsx src/cli/client.ts groups list` to resolve IDs, then `groups restart --id <group-id>` for affected running groups. Cardi, Maven, and Amp each returned `restarted: 1`; `systemctl is-active nanoclaw.service` returned `active`.
+- Without `--message`, restart stops the current container and the group resumes on its next message. History remains intact; no failed messages were replayed and no test messages were sent. Idle groups use the updated vault credential when they next wake.
+
+The supplied `/tmp/codex-auth.json` was restricted to `0600` and left in place during this repair; deletion was not performed. No credential values were recorded in these notes.
