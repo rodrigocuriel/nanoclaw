@@ -95,6 +95,22 @@ describe('createChatSdkBridge', () => {
     });
     expect(typeof bridge.subscribe).toBe('function');
   });
+
+  it('reports an adapter transport probe when one is available', () => {
+    let connected = false;
+    const adapter = stubAdapter({}) as Adapter & { isConnected(): boolean };
+    adapter.isConnected = () => connected;
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true });
+
+    expect(bridge.isConnected()).toBe(false);
+    connected = true;
+    expect(bridge.isConnected()).toBe(true);
+  });
+
+  it('keeps adapters without a transport probe available after setup', () => {
+    const bridge = createChatSdkBridge({ adapter: stubAdapter({}), supportsThreads: true });
+    expect(bridge.isConnected()).toBe(true);
+  });
 });
 
 describe('createChatSdkBridge — instance identity', () => {
@@ -145,24 +161,27 @@ describe('createChatSdkBridge.setup — webhook route and state namespace', () =
   // StateAdapter (chat_sdk_* tables) and an adapter.initialize — nothing
   // platform-side. registerWebhookAdapter is mocked at module level so we
   // can assert the (chat, adapterName, routingPath) triple.
-  function setupStubAdapter(): Adapter {
-    return stubAdapter({
-      name: 'slack',
-      initialize: async () => {},
-    } as unknown as Partial<Adapter>);
+  // runtimeMode is assigned inside initialize(), as the Telegram adapter does
+  // when mode 'auto' resolves: a guard that reads it earlier sees undefined.
+  function setupStubAdapter(runtimeMode?: 'webhook' | 'polling'): Adapter {
+    const adapter = stubAdapter({ name: 'slack' }) as Adapter & { runtimeMode?: string };
+    adapter.initialize = async () => {
+      adapter.runtimeMode = runtimeMode;
+    };
+    return adapter;
   }
 
   beforeEach(async () => {
     const { initTestDb } = await import('../db/connection.js');
     const { runMigrations } = await import('../db/migrations/index.js');
-    runMigrations(initTestDb());
+    await runMigrations(await initTestDb());
     const { registerWebhookAdapter } = await import('../webhook-server.js');
     vi.mocked(registerWebhookAdapter).mockClear();
   });
 
   afterEach(async () => {
     const { closeDb } = await import('../db/connection.js');
-    closeDb();
+    await closeDb();
   });
 
   const hostConfig = {
@@ -197,6 +216,34 @@ describe('createChatSdkBridge.setup — webhook route and state namespace', () =
     await bridge.teardown();
   });
 
+  // Polling adapters (Telegram) pull updates themselves; a registered route
+  // would lazily bind the shared webhook port, and a busy port then crashes a
+  // Telegram-only host. Kill condition: delete the `runtimeMode === 'polling'`
+  // branch in setup() and the polling case goes red.
+  it('polling adapter (mode resolved inside initialize) registers no webhook route', async () => {
+    const { registerWebhookAdapter } = await import('../webhook-server.js');
+    const bridge = createChatSdkBridge({ adapter: setupStubAdapter('polling'), supportsThreads: true });
+    await bridge.setup(hostConfig);
+    expect(registerWebhookAdapter).not.toHaveBeenCalled();
+    await bridge.teardown();
+  });
+
+  it('webhook adapter registers the route', async () => {
+    const { registerWebhookAdapter } = await import('../webhook-server.js');
+    const bridge = createChatSdkBridge({ adapter: setupStubAdapter('webhook'), supportsThreads: true });
+    await bridge.setup(hostConfig);
+    expect(registerWebhookAdapter).toHaveBeenCalledTimes(1);
+    await bridge.teardown();
+  });
+
+  it('adapter without runtimeMode registers the route (non-Telegram adapters declare none)', async () => {
+    const { registerWebhookAdapter } = await import('../webhook-server.js');
+    const bridge = createChatSdkBridge({ adapter: setupStubAdapter(), supportsThreads: true });
+    await bridge.setup(hostConfig);
+    expect(registerWebhookAdapter).toHaveBeenCalledTimes(1);
+    await bridge.teardown();
+  });
+
   it('named instance namespaces Chat SDK state; default stays unprefixed (live-install constraint)', async () => {
     const { getDb } = await import('../db/connection.js');
 
@@ -212,9 +259,9 @@ describe('createChatSdkBridge.setup — webhook route and state namespace', () =
     await def.setup(hostConfig);
     await def.subscribe!('slack:C1', 'slack:T1');
 
-    const rows = getDb().prepare('SELECT thread_id FROM chat_sdk_subscriptions ORDER BY thread_id').all() as Array<{
-      thread_id: string;
-    }>;
+    const rows = await getDb().all<{ thread_id: string }>(
+      'SELECT thread_id FROM chat_sdk_subscriptions ORDER BY thread_id',
+    );
     expect(rows.map((r) => r.thread_id)).toEqual(['slack-tester:slack:T1', 'slack:T1']);
 
     await named.teardown();
@@ -230,11 +277,118 @@ describe('createChatSdkBridge.setup — webhook route and state namespace', () =
     });
     await bridge.setup(hostConfig);
     await bridge.subscribe!('slack:C1', 'slack:T9');
-    const rows = getDb().prepare('SELECT thread_id FROM chat_sdk_subscriptions').all() as Array<{
-      thread_id: string;
-    }>;
+    const rows = await getDb().all<{ thread_id: string }>('SELECT thread_id FROM chat_sdk_subscriptions');
     expect(rows.map((r) => r.thread_id)).toEqual(['slack:T9']);
     await bridge.teardown();
+  });
+});
+
+describe('createChatSdkBridge.deliver — ask_question cards (button styles)', () => {
+  // Approval cards color their buttons (Slack: primary→green, danger→red).
+  // The bridge must forward the normalized option style into Button() and
+  // omit it when unset — an invalid style surviving to Block Kit would fail
+  // the whole card with invalid_blocks (effective auto-deny).
+
+  interface CapturedButton {
+    type?: string;
+    id?: string;
+    label?: string;
+    value?: string;
+    style?: string;
+  }
+
+  function buttonsFrom(calls: PostCall[]): CapturedButton[] {
+    const msg = calls[0].message as {
+      card?: { children?: Array<{ type?: string; children?: CapturedButton[] }> };
+    };
+    const actionsRow = msg.card?.children?.find((c) => c.type === 'actions');
+    expect(actionsRow).toBeDefined();
+    return actionsRow?.children ?? [];
+  }
+
+  it('passes each option style through to the Button, and omits it when unset', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    await bridge.deliver('slack:C1', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'q-1',
+        title: 'Approval needed',
+        question: 'Allow the tool call?',
+        options: [
+          { label: 'Approve', style: 'primary' },
+          { label: 'Deny', style: 'danger' },
+          'Skip', // string shorthand — never styled
+        ],
+      },
+    });
+    expect(calls).toHaveLength(1);
+    const buttons = buttonsFrom(calls);
+    expect(buttons.map((b) => b.label)).toEqual(['Approve', 'Deny', 'Skip']);
+    expect(buttons.map((b) => b.style)).toEqual(['primary', 'danger', undefined]);
+  });
+
+  it('drops invalid styles before they reach the Button (delivery goes through normalizeOptions)', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    await bridge.deliver('slack:C1', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'q-2',
+        title: 'Approval needed',
+        question: 'Allow the tool call?',
+        options: [{ label: 'Approve', style: 'chartreuse' }],
+      },
+    });
+    const buttons = buttonsFrom(calls);
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].style).toBeUndefined();
+  });
+
+  it('retains the approval body and replaces buttons with a muted timeout resolution', async () => {
+    const edits: PostCall[] = [];
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({
+        editMessage: async (threadId, _messageId, message) => {
+          edits.push({ threadId, message });
+          return { id: 'msg-1', threadId, raw: {} };
+        },
+      }),
+      supportsThreads: false,
+    });
+
+    await bridge.deliver('slack:C1', null, {
+      kind: 'chat-sdk',
+      content: {
+        operation: 'edit',
+        messageId: 'msg-1',
+        text: 'Credentials Request\n\n*Agent:* Andy\n*Action:* Send email\n\n⏱️ Timed out — no response',
+        terminalCard: {
+          title: 'Credentials Request',
+          question: '*Agent:* Andy\n*Action:* Send email',
+          resolution: '⏱️ Timed out — no response',
+        },
+      },
+    });
+
+    expect(edits).toHaveLength(1);
+    const edited = edits[0].message as {
+      card: { title: string; children: Array<{ type: string; content?: string; style?: string }> };
+    };
+    expect(edited.card.title).toBe('Credentials Request');
+    expect(edited.card.children).toEqual([
+      { type: 'text', content: '*Agent:* Andy\n*Action:* Send email' },
+      { type: 'text', content: '⏱️ Timed out — no response', style: 'muted' },
+    ]);
+    expect(edited.card.children.some((child) => child.type === 'actions')).toBe(false);
   });
 });
 
@@ -321,6 +475,60 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
     expect(buttons[0].url).toBe('https://example.com');
   });
 
+  it('survives a null action instead of throwing on a property read', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    await bridge.deliver('discord:guild:chan', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        card: {
+          title: 'Docs',
+          actions: [null, { label: 'Open', url: 'https://example.com' }],
+        },
+      },
+    });
+    const msg = calls[0].message as {
+      card?: { children?: Array<{ type?: string; children?: Array<{ type?: string; url?: string }> }> };
+    };
+    const buttons = msg.card?.children?.find((c) => c.type === 'actions')?.children ?? [];
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].url).toBe('https://example.com');
+  });
+
+  it('renders an unknown style as the default button style rather than dropping the action', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    await bridge.deliver('discord:guild:chan', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        card: {
+          title: 'Docs',
+          actions: [
+            { label: 'Open', url: 'https://example.com', style: 'chartreuse' },
+            { label: 'Also', url: 'https://example.org', style: null },
+          ],
+        },
+      },
+    });
+    const msg = calls[0].message as {
+      card?: {
+        children?: Array<{ type?: string; children?: Array<{ type?: string; url?: string; style?: string }> }>;
+      };
+    };
+    const buttons = msg.card?.children?.find((c) => c.type === 'actions')?.children ?? [];
+    expect(buttons).toHaveLength(2);
+    expect(buttons[0].style).toBeUndefined();
+    expect(buttons[1].style).toBeUndefined();
+  });
+
   it('skips delivery when the card has neither title nor body content', async () => {
     const { calls, postMessage } = makePostCapture();
     const bridge = createChatSdkBridge({
@@ -349,4 +557,103 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
     const msg = calls[0].message as { markdown?: string };
     expect(msg.markdown).toBe('plain hello');
   });
+});
+
+it('uses a registered approval presentation losslessly for initial and terminal cards', async () => {
+  const { registerQuestionRenderResolver } = await import('./question-render-registry.js');
+  const evidence = 'full evidence\n'.repeat(500);
+  registerQuestionRenderResolver((id) =>
+    id === 'presentation-fixture'
+      ? {
+          title: 'Review',
+          options: [],
+          deferResolution: true,
+          renderMessage: () => ({ markdown: evidence }),
+          renderTerminal: (resolution) => ({ markdown: `${evidence}\n${resolution}` }),
+        }
+      : undefined,
+  );
+  const { calls, postMessage } = makePostCapture();
+  const edits: PostCall[] = [];
+  const bridge = createChatSdkBridge({
+    adapter: stubAdapter({
+      postMessage,
+      editMessage: async (threadId, _id, message) => {
+        edits.push({ threadId, message });
+        return { id: 'card', threadId, raw: {} };
+      },
+    }),
+    supportsThreads: false,
+  });
+  await bridge.deliver('stub:C1', null, {
+    kind: 'chat-sdk',
+    content: {
+      type: 'ask_question',
+      questionId: 'presentation-fixture',
+      title: 'Review',
+      options: [],
+      requirePresentation: true,
+    },
+  });
+  expect(calls[0].message).toEqual({ markdown: evidence });
+  await bridge.deliver('stub:C1', null, {
+    kind: 'chat-sdk',
+    content: {
+      operation: 'edit',
+      questionId: 'presentation-fixture',
+      messageId: 'card',
+      terminalCard: { resolution: 'Rejected' },
+    },
+  });
+  expect(edits[0].message).toEqual({ markdown: `${evidence}\nRejected` });
+});
+
+it('forwards the authenticated instance and message address without editing a deferred approval', async () => {
+  const { initTestDb, closeDb } = await import('../db/connection.js');
+  const { runMigrations } = await import('../db/migrations/index.js');
+  const { registerQuestionRenderResolver } = await import('./question-render-registry.js');
+  await runMigrations(await initTestDb());
+  registerQuestionRenderResolver((id) =>
+    id === 'address-fixture'
+      ? {
+          title: 'Review',
+          options: [{ label: 'Approve', selectedLabel: 'Approved', value: 'approve' }],
+          deferResolution: true,
+        }
+      : undefined,
+  );
+  const editMessage = vi.fn();
+  const adapter = stubAdapter({
+    name: 'fixture',
+    initialize: async () => {},
+    channelIdFromThreadId: (threadId: string) => threadId,
+    editMessage,
+  });
+  const bridge = createChatSdkBridge({ adapter, instance: 'fixture-one', supportsThreads: false });
+  const onAction = vi.fn();
+  try {
+    await bridge.setup({ onInbound: () => {}, onInboundEvent: () => {}, onMetadata: () => {}, onAction });
+    const chat = (bridge as unknown as { _chat: import('chat').Chat })._chat;
+    await chat.processAction(
+      {
+        actionId: 'ncq:address-fixture:0',
+        adapter,
+        messageId: 'original-card',
+        raw: {},
+        threadId: 'fixture:room',
+        user: { userId: 'selected' } as never,
+        value: '0',
+      },
+      undefined,
+    );
+    expect(onAction).toHaveBeenCalledWith('address-fixture', 'approve', 'selected', {
+      instance: 'fixture-one',
+      messageId: 'original-card',
+      platformId: 'fixture:room',
+    });
+    expect(editMessage).not.toHaveBeenCalled();
+  } finally {
+    await bridge.teardown();
+    await closeDb();
+  }
 });

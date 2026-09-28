@@ -1,8 +1,6 @@
 // Provider self-registration barrel.
-// Each import triggers the provider module's registerProvider() call at top
-// level. Skills add a new provider by appending one import line below.
+// Each import triggers the provider module registration at startup.
 
 import './claude.js';
-import './mock.js';
 import './opencode.js';
 import './codex.js';

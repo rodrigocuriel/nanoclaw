@@ -4,37 +4,36 @@
  * Thin orchestrator: init DB, run migrations, start channel adapters,
  * start delivery polls, start sweep, handle shutdown.
  */
-import fs from 'fs';
-import path from 'path';
-
 import { backfillContainerConfigs } from './backfill-container-configs.js';
-import { DATA_DIR } from './config.js';
+import { CENTRAL_DB_PATH } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
-import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
-import { initDb } from './db/connection.js';
+import {
+  abortGatewaySessionObservers,
+  adoptRunningSessions,
+  resumeGatewaySessionAdmission,
+  stopGatewaySessionsForUnavailability,
+} from './container-runner.js';
+import { closeDb, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
-import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
+import { getSessionDriver } from './drivers/index.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
+import { startHostInstanceLease, stopHostInstanceLease } from './host-instance.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { startHostModules, stopHostModules } from './host-lifecycle.js';
+import { startGatewayApprovalCoordinator, stopGatewayApprovalCoordinator } from './gateway-approval-coordinator.js';
+import { startGatewayAvailabilityMonitor } from './gateway-availability.js';
+import { getGatewayProvider } from './gateway-providers/index.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 
-// Response + shutdown registries live in response-registry.ts to break the
+// Response registry lives in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
-// effects, and the modules call registerResponseHandler/onShutdown at top
-// level — which would hit a TDZ error if the arrays lived here. Re-exported
-// here so existing callers see the same surface.
-import {
-  registerResponseHandler,
-  getResponseHandlers,
-  onShutdown,
-  getShutdownCallbacks,
-  type ResponsePayload,
-  type ResponseHandler,
-} from './response-registry.js';
-export { registerResponseHandler, onShutdown };
-export type { ResponsePayload, ResponseHandler };
+// effects, and the modules call registerResponseHandler at top level — which
+// would hit a TDZ error if the array lived here.
+import { getResponseHandlers, type ResponsePayload } from './response-registry.js';
+
+const hostAbortController = new AbortController();
 
 async function dispatchResponse(payload: ResponsePayload): Promise<void> {
   for (const handler of getResponseHandlers()) {
@@ -52,8 +51,8 @@ async function dispatchResponse(payload: ResponsePayload): Promise<void> {
 // Channel skills uncomment lines in channels/index.ts to enable them.
 import './channels/index.js';
 
-// Modules barrel — default modules (typing, mount-security) ship here; skills
-// append registry-based modules. Imported for side effects (registrations).
+// Modules barrel — imports registration modules, including the singular
+// mailbox composition slot. Imported for side effects.
 import './modules/index.js';
 
 // CLI command barrel — populates the `ncl` registry before the CLI server
@@ -69,29 +68,10 @@ import {
   createChannelDeliveryAdapter,
 } from './channels/channel-registry.js';
 
+let stopGatewayAvailabilityMonitor: (() => void) | undefined;
+
 async function main(): Promise<void> {
   log.info('NanoClaw starting');
-
-  // 0a. Redirect TMPDIR to a runtime-shareable directory on macOS.
-  //
-  // The OneCLI SDK writes its gateway CA bundles (onecli-proxy-ca.pem,
-  // onecli-combined-ca.pem) under os.tmpdir() and then bind-mounts those exact
-  // files into each agent container so the in-container API client trusts the
-  // credential-injection proxy. On macOS, os.tmpdir() resolves to $TMPDIR
-  // (/var/folders/...), which Rancher Desktop and Apple `container` do NOT
-  // share into their VMs. A single-file bind-mount whose host source the VM
-  // can't see silently materializes as an empty directory inside the
-  // container — so NODE_EXTRA_CA_CERTS points at a directory, the CA never
-  // loads, and every API call fails with "self-signed certificate detected".
-  // The user-mounted home tree (/Users) is shared, so redirecting TMPDIR under
-  // DATA_DIR puts the CA files somewhere the bind-mount can actually resolve.
-  // No-op on Linux, where the host /tmp is shared with containers natively.
-  if (process.platform === 'darwin') {
-    const sharedTmp = path.join(DATA_DIR, 'tmp');
-    fs.mkdirSync(sharedTmp, { recursive: true });
-    process.env.TMPDIR = sharedTmp;
-    log.info('Redirected TMPDIR to a container-shareable path', { tmpdir: sharedTmp });
-  }
 
   // 0. Circuit breaker — backoff on rapid restarts
   await enforceStartupBackoff();
@@ -100,54 +80,64 @@ async function main(): Promise<void> {
   // outside the sanctioned path (raw `git pull` instead of /update-nanoclaw).
   enforceUpgradeTripwire();
 
+  // Select once and fail before serving if the configured package is absent.
+  const gatewayProvider = getGatewayProvider();
+
   // 1. Init central DB
-  const dbPath = path.join(DATA_DIR, 'v2.db');
-  const db = initDb(dbPath);
-  runMigrations(db);
-  log.info('Central DB ready', { path: dbPath });
+  const db = await initDb(CENTRAL_DB_PATH, { role: 'host' });
+  await runMigrations(db, undefined, { mode: 'auto' });
+  log.info('Central DB ready', { dialect: db.dialect });
 
   // 1b. Backfill container_configs from legacy container.json files.
   // Idempotent — skips groups that already have a config row.
-  backfillContainerConfigs();
+  if (db.dialect === 'sqlite') await backfillContainerConfigs();
+  else log.info('Skipping local container.json backfill for non-local central DB');
 
-  // 1c. One-time filesystem cutover — idempotent, no-op after first run.
-  migrateGroupsToClaudeLocal();
+  // Prepare the runtime; inbound routing waits until approval health and adoption are ready.
+  await getSessionDriver().ensureReady?.();
+  await startHostInstanceLease();
+  let releaseInbound!: () => void;
+  const inboundReady = new Promise<void>((resolve) => {
+    releaseInbound = resolve;
+  });
 
-  // 2. Container runtime
-  ensureContainerRuntimeRunning();
-  cleanupOrphans();
-
-  // 3. Channel adapters
+  // 2. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {
       onInbound(platformId, threadId, message) {
-        routeInbound({
-          channelType: adapter.channelType,
-          // The one host-side stamping seam: adapters stay instance-blind,
-          // the host stamps the receiving instance on every inbound event.
-          instance: adapter.instance ?? adapter.channelType,
-          platformId,
-          threadId,
-          message: {
-            id: message.id,
-            kind: message.kind,
-            content: JSON.stringify(message.content),
-            timestamp: message.timestamp,
-            isMention: message.isMention,
-            isGroup: message.isGroup,
-          },
-        }).catch((err) => {
-          log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
-        });
+        inboundReady
+          .then(() =>
+            routeInbound({
+              channelType: adapter.channelType,
+              // The one host-side stamping seam: adapters stay instance-blind,
+              // the host stamps the receiving instance on every inbound event.
+              instance: adapter.instance ?? adapter.channelType,
+              platformId,
+              threadId,
+              message: {
+                id: message.id,
+                kind: message.kind,
+                content: JSON.stringify(message.content),
+                timestamp: message.timestamp,
+                isMention: message.isMention,
+                isGroup: message.isGroup,
+              },
+            }),
+          )
+          .catch((err) => {
+            log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
+          });
       },
       onInboundEvent(event) {
-        routeInbound(event).catch((err) => {
-          log.error('Failed to route inbound event', {
-            sourceAdapter: adapter.channelType,
-            targetChannelType: event.channelType,
-            err,
+        inboundReady
+          .then(() => routeInbound(event))
+          .catch((err) => {
+            log.error('Failed to route inbound event', {
+              sourceAdapter: adapter.channelType,
+              targetChannelType: event.channelType,
+              err,
+            });
           });
-        });
       },
       onMetadata(platformId, name, isGroup) {
         log.info('Channel metadata discovered', {
@@ -157,17 +147,16 @@ async function main(): Promise<void> {
           isGroup,
         });
       },
-      onAction(questionId, selectedOption, userId) {
+      onAction(questionId, selectedOption, userId, address) {
         dispatchResponse({
           questionId,
           value: selectedOption,
           userId,
           channelType: adapter.channelType,
-          // platformId/threadId aren't surfaced by the current onAction
-          // signature — registered handlers look them up from the
-          // pending_question / pending_approval row.
-          platformId: '',
-          threadId: null,
+          instance: address?.instance ?? adapter.instance ?? adapter.channelType,
+          messageId: address?.messageId,
+          platformId: address?.platformId ?? '',
+          threadId: address?.threadId ?? null,
         }).catch((err) => {
           log.error('Failed to handle question response', { questionId, err });
         });
@@ -175,22 +164,41 @@ async function main(): Promise<void> {
     };
   });
 
-  // 4. Delivery adapter bridge — dispatches to channel adapters by EXACT
+  // 3. Delivery adapter bridge — dispatches to channel adapters by EXACT
   // registry key (instance ?? channelType): a named instance with an
   // offline adapter is never rerouted through a sibling bot. See
   // createChannelDeliveryAdapter in channels/channel-registry.ts.
-  setDeliveryAdapter(createChannelDeliveryAdapter());
+  const deliveryAdapter = createChannelDeliveryAdapter();
+  setDeliveryAdapter(deliveryAdapter);
 
-  // 5. Start delivery polls
+  // 4. Core starts the selected gateway's normalized approval subscription
+  // only after persistence and delivery are ready.
+  await startGatewayApprovalCoordinator(gatewayProvider, deliveryAdapter, stopGatewaySessionsForUnavailability, {
+    onAvailable: resumeGatewaySessionAdmission,
+    waitUntilReady: true,
+  });
+  stopGatewayAvailabilityMonitor = await startGatewayAvailabilityMonitor(
+    gatewayProvider,
+    stopGatewaySessionsForUnavailability,
+    resumeGatewaySessionAdmission,
+  );
+  await adoptRunningSessions();
+  releaseInbound();
+
+  // 6. Start registered host modules. Imports only registered callbacks; the
+  // actual work begins here, after DB + delivery are ready and before polls.
+  await startHostModules({ db, deliveryAdapter, signal: hostAbortController.signal });
+
+  // 6. Start delivery polls
   startActiveDeliveryPoll();
   startSweepDeliveryPoll();
   log.info('Delivery polls started');
 
-  // 6. Start host sweep
+  // 8. Start host sweep
   startHostSweep();
   log.info('Host sweep started');
 
-  // 7. Start the `ncl` CLI socket server (data/ncl.sock).
+  // 9. Start the `ncl` CLI socket server (data/ncl.sock).
   await startCliServer();
 
   log.info('NanoClaw running');
@@ -199,19 +207,20 @@ async function main(): Promise<void> {
 /** Graceful shutdown. */
 async function shutdown(signal: string): Promise<void> {
   log.info('Shutdown signal received', { signal });
-  for (const cb of getShutdownCallbacks()) {
-    try {
-      await cb();
-    } catch (err) {
-      log.error('Shutdown callback threw', { err });
-    }
-  }
+  hostAbortController.abort();
+  stopGatewayAvailabilityMonitor?.();
+  await stopGatewayApprovalCoordinator();
+  await abortGatewaySessionObservers();
+  await stopHostModules();
+  // Stamp the durable stop before the DB closes below.
+  await stopHostInstanceLease();
   stopDeliveryPolls();
   stopHostSweep();
   await stopCliServer();
   try {
     await teardownChannelAdapters();
   } finally {
+    await closeDb();
     // Always reset on graceful shutdown — even if teardown threw, we got here
     // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted
     // as one.
@@ -220,8 +229,8 @@ async function shutdown(signal: string): Promise<void> {
   }
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
 
 main().catch((err) => {
   log.fatal('Startup failed', { err });
