@@ -18,6 +18,11 @@ import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from 
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
+// Keep the host-side liveness marker fresh while a provider turn is running.
+// Provider streams can be silent for longer than the host's absolute ceiling
+// (for example while Codex is working in a repository), so event-driven
+// heartbeat updates alone can make healthy work look stalled.
+const ACTIVE_HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 
 /**
  * Number of consecutive `database disk image is malformed` errors after which
@@ -481,6 +486,7 @@ export async function processQuery(
       }
     })();
   }, ACTIVE_POLL_INTERVAL_MS);
+  const activeHeartbeatHandle = setInterval(touchHeartbeat, ACTIVE_HEARTBEAT_INTERVAL_MS);
 
   try {
     for await (const event of query.events) {
@@ -559,6 +565,7 @@ export async function processQuery(
   } finally {
     done = true;
     clearInterval(pollHandle);
+    clearInterval(activeHeartbeatHandle);
   }
 
   return { continuation: queryContinuation };
