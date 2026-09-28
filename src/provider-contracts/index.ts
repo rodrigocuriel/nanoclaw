@@ -3,3 +3,5 @@
 import './claude.js';
 
 export * from './registry.js';
+import './codex.js';
+import './opencode.js';

@@ -1,89 +1,87 @@
-import { spawn, spawnSync, type ChildProcess } from 'child_process';
-import { existsSync } from 'fs';
+import { initializeOpenCodeAuth } from './opencode-auth.js';
+import { spawn, type ChildProcess } from 'child_process';
+import { lstatSync, realpathSync } from 'fs';
+import path from 'path';
 import { pathToFileURL } from 'url';
 
-import { createOpencodeClient, type FilePartInput, type OpencodeClient } from '@opencode-ai/sdk';
-// The root `@opencode-ai/sdk` client (pinned ^1.4.3, resolves 1.4.11 on this
-// branch) has no `.question` surface at all — reply/reject/list for the
-// interactive `question` tool only exist on the `/v2` subpath client (present
-// in both 1.4.11 and 1.4.17; verified via `npm pack` .d.ts). Import it
+import { createOpencodeClient, type FilePartInput } from '@opencode-ai/sdk';
+// The root client has no `.question` surface; reply/reject/list for the
+// interactive `question` tool live on the `/v2` subpath client. Import it
 // separately so the session/event client above is untouched.
 import { createOpencodeClient as createOpencodeQuestionClient } from '@opencode-ai/sdk/v2';
 
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
-import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
+import {
+  buildOpenCodeConfig,
+  buildOpenCodeServerEnv,
+  resolveOpenCodeInference,
+  resolveOpenCodePromptModel,
+} from './opencode-config.js';
+import { buildDeliverySentences } from '../compact-instructions.js';
+import type { ResolvedRuntimeConfiguration } from '../provider-contracts/registry.js';
+import { getTaskSeriesId } from '../db/session-routing.js';
 import { getAllDestinations } from '../destinations.js';
+import { prepareOpenCodeMemory, type OpenCodeMemorySessionHook } from './opencode-memory.js';
+import {
+  boundedOpenCodeCall,
+  executeOpenCodeTurn,
+  OpenCodeEventPump,
+  type OpenCodeSessionClient,
+} from './opencode-turn.js';
 
 function log(msg: string): void {
   console.error(`[opencode-provider] ${msg}`);
 }
 
-// The input modalities OpenCode's config schema accepts on a model entry
-// (@opencode-ai/sdk types.gen.d.ts `modalities.input`). Anything outside this
-// set makes OpenCode reject the whole config, so operator input is validated
-// against it rather than passed through.
-const MODEL_INPUT_MODALITIES = ['text', 'audio', 'image', 'video', 'pdf'] as const;
-
-const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
-
 /**
- * The agent workspace: the group directory the host mounts RW, holding the
- * composed project document, the group's memory, and its working files. Both
- * the server's cwd and every instruction path resolve here.
+ * In-turn watchdog defaults (see the two tiers in `query()`). Env overrides:
+ * `OPENCODE_STREAM_SILENCE_MS` and `OPENCODE_IDLE_TIMEOUT_MS`. The server
+ * heartbeats every 10 s, so 60 s of total silence is six missed beats; the
+ * activity budget is generous because a single tool call (a long build, a
+ * browser session) legitimately streams nothing for many minutes.
  */
+const DEFAULT_STREAM_SILENCE_MS = 60_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 900_000;
+
 const AGENT_DIR = '/workspace/agent';
+const DEFAULT_NATIVE_ATTACHMENT_MAX_COUNT = 8;
+const DEFAULT_NATIVE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 
-/** Stale / dead OpenCode session heuristics (complement Claude-centric host patterns). */
-const STALE_SESSION_RE =
-  /no conversation found|ENOENT.*\.jsonl|session.*not found|NotFoundError|connection reset|ECONNRESET|404|event timeout/i;
-
-/**
- * Codex `startOrResumeCodexThread` starts a fresh thread when `thread/resume`
- * reports the id gone. OpenCode's equivalent failure is quieter: a poisoned
- * session accepts `promptAsync`, emits `session.idle` at step 0 with no
- * assistant work, and the runner treats that as a finished turn. Only a
- * *resume* that produced no assistant work should fall back, and only once
- * per query — a brand-new session that stays dry is a model/tools miss, not
- * a dead continuation.
- */
-export function isEmptyOpenCodeResume(opts: {
-  resumedExistingSession: boolean;
-  alreadyFellBack: boolean;
-  sawAssistantWork: boolean;
-}): boolean {
-  return opts.resumedExistingSession && !opts.alreadyFellBack && !opts.sawAssistantWork;
-}
+/** Native session lookup errors invalidate a stored continuation; backend/network failures do not. */
+const STALE_SESSION_RE = /"name":"NotFoundError"/;
 
 function killProcessTree(proc: ChildProcess): void {
-  if (!proc.pid) return;
-  try {
-    process.kill(-proc.pid, 'SIGKILL');
-  } catch {
+  if (proc.pid) {
     try {
-      proc.kill('SIGKILL');
+      process.kill(-proc.pid, 'SIGKILL');
+      return;
     } catch {
-      /* ignore */
+      /* fall through to the single-process kill */
     }
+  }
+  // No pid (spawn never produced one) or the group signal failed: best-effort
+  // on the handle itself. A ChildProcess without a pid returns false here.
+  try {
+    proc.kill('SIGKILL');
+  } catch {
+    /* ignore */
   }
 }
 
-function spawnOpencodeServer(config: Record<string, unknown>, timeoutMs = 10_000): Promise<{ url: string; proc: ChildProcess }> {
+export function spawnOpencodeServer(
+  config: Record<string, unknown>,
+  timeoutMs = 10_000,
+): Promise<{ url: string; proc: ChildProcess }> {
   return new Promise((resolve, reject) => {
+    initializeOpenCodeAuth(process.env.XDG_DATA_HOME ?? '/opencode-xdg', process.env.OPENCODE_AUTH_MODE);
     const hostname = '127.0.0.1';
     const port = 4096;
     const proc = spawn('opencode', ['serve', `--hostname=${hostname}`, `--port=${port}`], {
-      // `opencode serve` has no --directory flag: the server's project
-      // directory IS its cwd, and both native project-doc discovery and the
-      // root that read/glob/grep/bash resolve against follow from it.
-      // Inherited, that was the image WORKDIR (/workspace/group) — a sibling
-      // of the agent workspace, so the tools ran in an empty directory.
-      // Codex passes the same directory explicitly; OpenCode had no equivalent.
+      // `opencode serve` has no directory flag. Its cwd is the project root
+      // used by native document discovery and built-in filesystem tools.
       cwd: AGENT_DIR,
-      env: {
-        ...process.env,
-        OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
-      },
+      env: buildOpenCodeServerEnv(config),
       detached: true,
     });
 
@@ -122,26 +120,20 @@ function spawnOpencodeServer(config: Record<string, unknown>, timeoutMs = 10_000
 }
 
 /**
- * One channel attachment, in structured form: a display name, a MIME type, a
- * path to the staged file inside the container, a remote URL — each present
- * only when the channel supplied it.
- *
- * Declared here rather than imported from `./types.js` because this file is
- * also installed onto agent-runners whose shared types carry no attachment
- * shape at all. Structural typing makes the two interchangeable wherever both
- * exist, so nothing is lost by keeping the declaration local, while an install
- * that predates the shared one still compiles.
+ * The shared attachment contract carries only host-staged files, bound to the
+ * source message whose inbox owns them. Remote URLs remain prompt text and are
+ * never fetched implicitly.
  *
  * Attachments are ALSO described inline in the prompt text the formatter
  * produces, and that text rendering stays the contract every provider relies
  * on. Everything below is an additive view for OpenCode's file parts: when no
  * structured attachment arrives, the provider behaves exactly as it did before.
  */
-export interface OpenCodePromptAttachment {
-  filename?: string;
+interface OpenCodePromptAttachment {
+  sourceMessageId: string;
+  filename: string;
+  path: string;
   mime?: string;
-  path?: string;
-  url?: string;
 }
 
 /** Extension → MIME fallback, for adapters that report no `mimeType`. */
@@ -162,18 +154,71 @@ function attachmentMime(att: OpenCodePromptAttachment): string | undefined {
   return dot < 0 ? undefined : ATTACHMENT_MIME_BY_EXT[name.slice(dot).toLowerCase()];
 }
 
+export interface NativeAttachmentLimits {
+  maxCount: number;
+  maxBytes: number;
+}
+
+export interface NativeAttachmentFileInfo {
+  realPath: string;
+  size: number;
+}
+
+function positiveIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  const parsed = Number(trimmed);
+  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(parsed) || parsed <= 0) {
+    log(`Ignoring invalid ${name}: "${raw}"`);
+    return fallback;
+  }
+  return parsed;
+}
+
+export function resolveNativeAttachmentLimits(): NativeAttachmentLimits {
+  return {
+    maxCount: positiveIntegerEnv('OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT', DEFAULT_NATIVE_ATTACHMENT_MAX_COUNT),
+    maxBytes: positiveIntegerEnv('OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES', DEFAULT_NATIVE_ATTACHMENT_MAX_BYTES),
+  };
+}
+
+function inspectNativeAttachment(filePath: string): NativeAttachmentFileInfo | null {
+  try {
+    const stat = lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) return null;
+    return { realPath: realpathSync(filePath), size: stat.size };
+  } catch {
+    return null;
+  }
+}
+
+function isPathInside(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function isSafeComponent(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value !== '.' &&
+    value !== '..' &&
+    !value.includes('/') &&
+    !value.includes('\\') &&
+    !value.includes('\0')
+  );
+}
+
 /**
  * Turn a turn's attachments into OpenCode file parts, so the model sees the
  * media itself rather than only the `[image: cat.png — saved to …]` line the
  * formatter already renders into the prompt text.
  *
  * The URL is a `file://` path, NOT a data: URI, deliberately: OpenCode resolves
- * a file: part server-side — packages/opencode/src/session/prompt.ts (v1.4.14)
- * `case "file:"` at :1043 does `fileURLToPath(part.url)` at :1045 and, for a
- * mime that is neither text/plain nor a directory, re-emits the part as
- * `data:${part.mime};base64,` + the file it read (:1197-1199). Base64-ing here
- * would only duplicate that work and inflate the request body. The server
- * shares this container's filesystem (spawnOpencodeServer), so the path resolves.
+ * a file: part server-side and converts supported local media for the model.
+ * Base64-ing here would duplicate that work and inflate the request body. The
+ * server shares this container's filesystem (spawnOpencodeServer), so the path
+ * resolves.
  *
  * Only images and PDFs are forwarded; PDFs go through even though a given
  * backend may reject them, since the alternative is silently withholding a
@@ -184,19 +229,45 @@ function attachmentMime(att: OpenCodePromptAttachment): string | undefined {
  */
 export function buildAttachmentFileParts(
   attachments: OpenCodePromptAttachment[] | undefined,
-  exists: (path: string) => boolean = existsSync,
+  inspect: (path: string) => NativeAttachmentFileInfo | null = inspectNativeAttachment,
+  limits: NativeAttachmentLimits = resolveNativeAttachmentLimits(),
 ): FilePartInput[] {
   const parts: FilePartInput[] = [];
+  let totalBytes = 0;
   for (const att of attachments ?? []) {
+    if (parts.length >= limits.maxCount) {
+      log(`Native attachment count limit reached (${limits.maxCount}); remaining files stay prompt text only`);
+      break;
+    }
+    if (!isSafeComponent(att.sourceMessageId) || !isSafeComponent(att.filename)) continue;
+    const expectedRoot = `/workspace/inbox/${att.sourceMessageId}`;
+    const expectedPath = `${expectedRoot}/${att.filename}`;
+    if (path.resolve(att.path) !== expectedPath) {
+      log(`Attachment path is not bound to its source message, not sent as media: ${att.filename}`);
+      continue;
+    }
     const mime = attachmentMime(att);
     if (!mime) continue;
     if (!mime.startsWith('image/') && mime !== 'application/pdf') continue;
-    if (!att.path || !exists(att.path)) {
-      const label = att.filename || att.path || att.url || 'unnamed';
-      log(`Attachment has no readable local file, not sent as media: ${label}`);
+    const info = inspect(att.path);
+    if (!info || !isPathInside(expectedRoot, info.realPath) || path.basename(info.realPath) !== att.filename) {
+      log(`Attachment has no safe regular file, not sent as media: ${att.filename}`);
       continue;
     }
-    parts.push({ type: 'file', mime, filename: att.filename, url: pathToFileURL(att.path).href });
+    if (info.size < 0 || totalBytes + info.size > limits.maxBytes) {
+      log(`Native attachment byte limit reached (${limits.maxBytes}); ${att.filename} stays prompt text only`);
+      continue;
+    }
+    totalBytes += info.size;
+    // OpenCode appends file parts after the combined batch text. Prefix the
+    // display name with the source id so two messages carrying `image.png`
+    // remain unambiguous to the model; the prompt text keeps the original name.
+    parts.push({
+      type: 'file',
+      mime,
+      filename: `${att.sourceMessageId}--${att.filename}`,
+      url: pathToFileURL(info.realPath).href,
+    });
   }
   return parts;
 }
@@ -211,259 +282,213 @@ export function buildAttachmentFileParts(
 export function buildPromptParts(
   text: string,
   attachments?: OpenCodePromptAttachment[],
-  exists: (path: string) => boolean = existsSync,
+  inspect: (path: string) => NativeAttachmentFileInfo | null = inspectNativeAttachment,
+  limits: NativeAttachmentLimits = resolveNativeAttachmentLimits(),
 ): Array<{ type: 'text'; text: string } | FilePartInput> {
-  return [{ type: 'text', text }, ...buildAttachmentFileParts(attachments, exists)];
+  return [{ type: 'text', text }, ...buildAttachmentFileParts(attachments, inspect, limits)];
 }
 
-function wrapPromptWithContext(text: string, systemInstructions?: string): string {
-  let out = text;
-  if (systemInstructions) {
-    out = `<system>\n${systemInstructions}\n</system>\n\n${out}`;
-  }
-  return out;
+type OpenCodeEvent = { type: string; properties: Record<string, unknown> };
+
+/**
+ * The client surface a shared runtime is built from: the per-turn session
+ * calls `OpenCodeRuntimeHandle` already narrows, plus the event subscription
+ * that only the shared (production) path opens. The real `OpencodeClient`
+ * satisfies it structurally; tests hand in a fake.
+ */
+/**
+ * The subset of the SDK's SSE options this module drives. `subscribe` spreads
+ * them through `get.sse` → `beforeRequest` → `createSseClient` (verified in
+ * @opencode-ai/sdk 1.18.25 dist/gen). Without a `signal`, that client swallows
+ * a closed socket and reconnects forever with backoff, so a killed server
+ * never ends the stream and an in-flight turn never learns it died.
+ */
+export interface SseSubscribeOptions {
+  signal?: AbortSignal;
+  sseSleepFn?: (ms: number) => Promise<void>;
+  onSseError?: (error: unknown) => void;
 }
 
-// A limit env var must be a bare positive integer (a token count) — units
-// ("64k"), blank strings, zero, and negatives are rejected rather than
-// coerced: Number() would turn blank into 0 (silently disables compaction,
-// see below) and "64k" into NaN (the emitted config becomes unparseable
-// JSON, and OpenCode fails to start). Invalid input is treated as unset.
-function parseLimitEnv(varName: string, raw: string | undefined): number | undefined {
-  if (raw === undefined) return undefined;
-  const trimmed = raw.trim();
-  if (!/^\d+$/.test(trimmed) || Number(trimmed) <= 0) {
-    log(`Ignoring invalid ${varName}: "${raw}"`);
-    return undefined;
-  }
-  return Number(trimmed);
-}
+type SharedRuntimeClient = OpenCodeRuntimeHandle['client'] & {
+  event: { subscribe(options?: SseSubscribeOptions): Promise<{ stream: AsyncGenerator<OpenCodeEvent, void, void> }> };
+};
 
-export function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> {
-  const provider = process.env.OPENCODE_PROVIDER || 'anthropic';
-  const model = process.env.OPENCODE_MODEL;
-  const smallModel = process.env.OPENCODE_SMALL_MODEL;
-  // Reasoning effort from the group's container config (ncl groups config
-  // update --effort). OpenCode forwards a free-form per-model `options` object
-  // to the ai-sdk provider, which maps reasoningEffort onto reasoning_effort in
-  // the request body.
-  const effort = options.effort;
-  const proxyUrl = process.env.ANTHROPIC_BASE_URL;
-
-  const providerModelId = model ? model.replace(new RegExp(`^${provider}/`), '') : undefined;
-  const providerSmallModelId = smallModel ? smallModel.replace(new RegExp(`^${provider}/`), '') : undefined;
-  const modelsToRegister = [providerModelId, providerSmallModelId]
-    .filter(Boolean)
-    .filter((mid, i, a) => a.indexOf(mid as string) === i);
-
-  // OpenCode auto-compacts a session once tokens >= limit.context - maxOutputTokens.
-  // Undeclared custom models resolve limit.context to 0, which silently disables
-  // compaction and kills long sessions against a fixed-window backend (e.g. vLLM).
-  // Absent these env vars, behavior is unchanged (no `limit` key emitted).
-  const contextLimitEnv = process.env.OPENCODE_MODEL_CONTEXT_LIMIT;
-  const outputLimitEnv = process.env.OPENCODE_MODEL_OUTPUT_LIMIT;
-  const contextLimit = parseLimitEnv('OPENCODE_MODEL_CONTEXT_LIMIT', contextLimitEnv);
-  const outputLimit = parseLimitEnv('OPENCODE_MODEL_OUTPUT_LIMIT', outputLimitEnv);
-  if (outputLimitEnv !== undefined && contextLimit === undefined) {
-    log('Ignoring OPENCODE_MODEL_OUTPUT_LIMIT: no valid OPENCODE_MODEL_CONTEXT_LIMIT to pair it with');
-  }
-  const modelLimit =
-    contextLimit !== undefined
-      ? { context: contextLimit, ...(outputLimit !== undefined ? { output: outputLimit } : {}) }
-      : undefined;
-
-  // OpenCode drops every non-text file part whose modality the model does not
-  // declare: provider/transform.ts:292 (v1.4.14) keeps a part only when
-  // `model.capabilities.input[modality]` is true, and otherwise substitutes
-  // `ERROR: Cannot read … (this model does not support <modality> input)`.
-  // A registry-unknown custom model resolves each of those flags to false
-  // (provider/provider.ts:1154-1158), so an image reaches the session store but
-  // never the model — live-confirmed on a vLLM-hosted model, which answered
-  // that it does not support image input while the prompt carried zero image
-  // tokens. Declaring the modalities is the only thing that opens that gate;
-  // `attachment` is a registry/UI flag rather than a pipeline gate, but it is
-  // set alongside so the entry stays internally consistent.
-  // Absent this env var, behavior is unchanged (no capability keys emitted).
-  const modalityEnv = process.env.OPENCODE_MODEL_INPUT_MODALITIES;
-  const requestedModalities = (modalityEnv ?? '')
-    .split(',')
-    .map((entry) => entry.trim().toLowerCase())
-    .filter(Boolean)
-    .filter((entry, i, a) => a.indexOf(entry) === i)
-    .filter((entry) => {
-      if ((MODEL_INPUT_MODALITIES as readonly string[]).includes(entry)) return true;
-      log(`Ignoring unknown OPENCODE_MODEL_INPUT_MODALITIES entry: ${entry}`);
-      return false;
-    })
-    .filter((entry) => entry !== 'text');
-  const modelModalities =
-    requestedModalities.length > 0
-      ? { input: ['text', ...requestedModalities], output: ['text'] }
-      : undefined;
-
-  const providerOptions: Record<string, unknown> =
-    provider === 'anthropic'
-      ? {}
-      : {
-          [provider]: {
-            // A custom base URL on the `openai` provider means a self-hosted
-            // OpenAI-compatible endpoint (vLLM, llama.cpp, …). The stock openai
-            // SDK package speaks the Responses API, whose multi-turn history
-            // vLLM rejects (assistant items lack id/status) — pin the Chat
-            // Completions transport. Scoped to `openai` only: other providers
-            // (e.g. `openrouter`, set alongside ANTHROPIC_BASE_URL per the
-            // documented OpenRouter config) ship their own native ai-sdk
-            // package and must keep OpenCode's default transport resolution.
-            ...(provider === 'openai' && proxyUrl ? { npm: '@ai-sdk/openai-compatible' } : {}),
-            options: { apiKey: 'placeholder', baseURL: proxyUrl },
-            ...(modelsToRegister.length > 0
-              ? {
-                  models: Object.fromEntries(
-                    modelsToRegister.map((mid) => {
-                      // limit/modalities describe the MAIN model only — the env
-                      // vars name no small-model equivalent. Spreading them onto
-                      // a distinct OPENCODE_SMALL_MODEL entry would falsely
-                      // declare its context window and media support as the
-                      // main model's own. A small model that differs from the
-                      // main one gets a bare entry instead, which resolves
-                      // through OpenCode's own undeclared-model default.
-                      const isMainModel = mid === providerModelId;
-                      return [
-                        mid,
-                        {
-                          id: mid,
-                          name: mid,
-                          tool_call: true,
-                          ...(isMainModel && effort ? { options: { reasoningEffort: effort } } : {}),
-                          ...(isMainModel && modelLimit ? { limit: modelLimit } : {}),
-                          ...(isMainModel && modelModalities ? { attachment: true, modalities: modelModalities } : {}),
-                        },
-                      ];
-                    }),
-                  ),
-                }
-              : {}),
-          },
-        };
-
-  const mcp = mcpServersToOpenCodeConfig(options.mcpServers);
-
-  // Named explicitly rather than left to the cwd walk: OpenCode takes the
-  // FIRST of AGENTS.md, CLAUDE.md, CONTEXT.md it finds and stops, so a stale
-  // AGENTS.md from a group that once ran codex would shadow the document the
-  // host just composed. Listed here it loads either way (resolved paths
-  // dedupe against the walk). CLAUDE.local.md is in no walk target list, so
-  // this array is the group memory file's only channel.
-  //
-  // Memory deliberately does NOT ride this array. OpenCode's instruction
-  // pipeline calls instruction.system() on every model request and rereads
-  // each file raw, so memory files listed here would be re-read (uncapped,
-  // unrendered) on every request instead of following the shared
-  // startup/clear/compact lifecycle. Memory is delivered by the registered
-  // memory session hook instead — see createMemoryLifecycle below.
-  const instructions = [`${AGENT_DIR}/CLAUDE.md`, `${AGENT_DIR}/CLAUDE.local.md`];
-
-  return {
-    ...(model ? { model } : {}),
-    ...(smallModel ? { small_model: smallModel } : {}),
-    enabled_providers: [provider],
-    // A flat `permission: 'allow'` string leaves every category — including
-    // `question`, OpenCode's built-in interactive multi-choice tool — to
-    // whatever OpenCode's own default/merge resolves it to. Server logs from
-    // a live session showed that resolution land on BOTH `question -> deny *`
-    // and `question -> allow *` for the same session: internally
-    // contradictory, and whichever rule wins last, `allow` sometimes does —
-    // and a headless container has no human to answer an interactive
-    // question, so any path that lets it fire wedges the session forever
-    // (see OpenCodeProvider's question.asked handling below for the runtime
-    // belt-and-suspenders). Enumerate every known permission category
-    // explicitly instead of relying on the wildcard string, so `question`
-    // resolves to a single deterministic value — `deny` — that can never
-    // contradict itself, while every other category keeps the prior
-    // "allow everything" behavior.
-    // A category OpenCode adds after this list was written is absent from it,
-    // and so resolves to OpenCode's own default rather than to `allow`.
-    permission: {
-      read: 'allow',
-      edit: 'allow',
-      glob: 'allow',
-      grep: 'allow',
-      list: 'allow',
-      bash: 'allow',
-      task: 'allow',
-      external_directory: 'allow',
-      todowrite: 'allow',
-      question: 'deny',
-      webfetch: 'allow',
-      websearch: 'allow',
-      codesearch: 'allow',
-      lsp: 'allow',
-      doom_loop: 'allow',
-      skill: 'allow',
-    },
-    autoupdate: false,
-    snapshot: false,
-    provider: providerOptions,
-    instructions,
-    mcp,
-  };
+/** The SDK's retry backoff, made to return the moment the runtime is released. */
+function abortableSleep(signal: AbortSignal): (ms: number) => Promise<void> {
+  return (ms) =>
+    new Promise<void>((resolve) => {
+      if (signal.aborted) return resolve();
+      const timer = setTimeout(done, ms);
+      function done(): void {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', done);
+        resolve();
+      }
+      signal.addEventListener('abort', done, { once: true });
+    });
 }
 
 type SharedRuntime = {
   proc: ChildProcess;
-  client: OpencodeClient;
+  client: SharedRuntimeClient;
   questionClient: QuestionClient;
-  stream: AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
+  stream: AsyncGenerator<OpenCodeEvent, void, void>;
   streamRelease: () => void;
 };
+
+/**
+ * What `ensureSharedRuntime` needs from the outside world, injectable so the
+ * shared-server lifecycle (spawn failure, init failure after spawn, server
+ * death, stream death) can be driven in tests without an `opencode serve`
+ * process. `OpenCodeRuntimeDeps` on the provider bypasses this whole path;
+ * this seam exercises it.
+ */
+export interface OpenCodeSharedRuntimeDeps {
+  spawnServer(config: Record<string, unknown>): Promise<{ url: string; proc: ChildProcess }>;
+  createClient(url: string, cwd: string): SharedRuntimeClient;
+  createQuestionClient(url: string): QuestionClient;
+}
+
+const defaultSharedRuntimeDeps: OpenCodeSharedRuntimeDeps = {
+  spawnServer: (config) => spawnOpencodeServer(config),
+  // OpenCode scopes sessions and tool execution by the directory carried by
+  // the SDK client. The server process cwd is not sufficient: without this
+  // option the SDK defaults requests to the server's launch directory.
+  // The cast bridges one declared gap: the handle types `prompt` parts as
+  // `unknown[]` so fakes stay light, while the SDK types them as its part
+  // union. Every call site passes `buildPromptParts` output, which is the
+  // SDK's own union, so the runtime shapes agree.
+  createClient: (url, cwd) => createOpencodeClient({ baseUrl: url, directory: cwd }) as unknown as SharedRuntimeClient,
+  createQuestionClient: (url) => createOpencodeQuestionClient({ baseUrl: url }),
+};
+
+let sharedRuntimeDeps: OpenCodeSharedRuntimeDeps = defaultSharedRuntimeDeps;
+
+export function setSharedRuntimeDepsForTesting(deps?: OpenCodeSharedRuntimeDeps): void {
+  sharedRuntimeDeps = deps ?? defaultSharedRuntimeDeps;
+}
 
 let sharedRuntime: SharedRuntime | null = null;
 let sharedConfigKey: string | null = null;
 let sharedInit: Promise<SharedRuntime> | null = null;
 
-function runtimeConfigKey(options: ProviderOptions): string {
-  return JSON.stringify({
-    mcp: mcpServersToOpenCodeConfig(options.mcpServers),
-    model: process.env.OPENCODE_MODEL,
-    small: process.env.OPENCODE_SMALL_MODEL,
-    op: process.env.OPENCODE_PROVIDER,
-  });
-}
-
-async function ensureSharedRuntime(options: ProviderOptions): Promise<SharedRuntime> {
-  const key = runtimeConfigKey(options);
+/**
+ * One `opencode serve` per container, reused across queries. Every failure
+ * mode leaves the module in a state the NEXT call can recover from: a failed
+ * init is never cached (so a slow listen line or a stolen port costs one turn,
+ * not the container's lifetime), a spawned server whose client setup fails is
+ * reaped rather than orphaned on its port, and a server that exits out from
+ * under us drops itself from the cache so the next turn respawns instead of
+ * failing instantly forever.
+ */
+async function ensureSharedRuntime(
+  options: ProviderOptions,
+  cwd: string,
+  configuration?: ResolvedRuntimeConfiguration,
+): Promise<SharedRuntime> {
+  const config = buildOpenCodeConfig(options, configuration);
+  const key = JSON.stringify({ config, cwd });
   if (sharedRuntime && sharedConfigKey === key) return sharedRuntime;
 
   if (sharedInit) return sharedInit;
 
-  sharedInit = (async () => {
+  const deps = sharedRuntimeDeps;
+  const init = (async (): Promise<SharedRuntime> => {
     if (sharedRuntime) {
       destroySharedRuntime();
     }
-    const config = buildOpenCodeConfig(options);
-    const { url, proc } = await spawnOpencodeServer(config);
-    const client = createOpencodeClient({ baseUrl: url });
-    const questionClient = createOpencodeQuestionClient({ baseUrl: url });
-    const sub = await client.event.subscribe();
-    const stream = sub.stream as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
-    // Belt-and-suspenders drain before this runtime serves any turn — see
-    // drainPendingQuestions doc comment.
-    await drainPendingQuestions(questionClient);
-    sharedRuntime = {
-      proc,
-      client,
-      questionClient,
-      stream,
-      streamRelease: () => {
-        void stream.return?.(undefined);
-      },
+    const { url, proc } = await deps.spawnServer(config);
+
+    let runtime: SharedRuntime;
+    // Owns the SSE subscription and its retry loop. Teardown closes the
+    // server socket and prevents reconnection, waking a parked next() so an
+    // active turn can report stream termination.
+    const streamAbort = new AbortController();
+    // SDK 1.18.25's abort handler does not handle reader.cancel() rejection.
+    // Cancel the fetch only after its reader listener is gone. A separate
+    // signal wakes retry backoff immediately when teardown was requested.
+    const releaseAbort = new AbortController();
+    const sleep = abortableSleep(releaseAbort.signal);
+    try {
+      const client = deps.createClient(url, cwd);
+      const questionClient = deps.createQuestionClient(url);
+      // Deliberately no `sseMaxRetryAttempts`: the SDK counts attempts
+      // cumulatively per subscription and never resets after a successful
+      // reconnect, so a cap would end a long-lived container's stream for
+      // good on the Nth transient /event hiccup. The abort signal (server
+      // exit, teardown) and the stream-silence watchdog are the stops.
+      const sub = await client.event.subscribe({
+        signal: streamAbort.signal,
+        onSseError: () => {
+          // The generated SDK calls this after removing its reader listener.
+          if (releaseAbort.signal.aborted) streamAbort.abort();
+        },
+        sseSleepFn: async (ms) => {
+          await sleep(ms);
+          if (releaseAbort.signal.aborted) streamAbort.abort();
+        },
+      });
+      const stream = sub.stream;
+      // Belt-and-suspenders drain before this runtime serves any turn — see
+      // drainPendingQuestions doc comment.
+      await drainPendingQuestions(questionClient);
+      runtime = {
+        proc,
+        client,
+        questionClient,
+        stream,
+        streamRelease: () => {
+          releaseAbort.abort();
+          // return() closes an idle reader. If next() is parked, killing the
+          // owned server closes its socket and onSseError ends the retry loop.
+          // Both paths remove the broken listener before aborting the fetch.
+          void stream.return(undefined).then(
+            () => streamAbort.abort(),
+            () => streamAbort.abort(),
+          );
+        },
+      };
+    } catch (err) {
+      // The server came up and is holding its port; nothing downstream will
+      // ever hold a handle to it, so this is the only place it can be reaped.
+      streamAbort.abort();
+      killProcessTree(proc);
+      throw err;
+    }
+
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (sharedRuntime?.proc !== proc) return;
+      log(`OpenCode server exited (code=${String(code)}, signal=${String(signal)}); next turn will respawn it`);
+      try {
+        runtime.streamRelease();
+      } catch {
+        /* ignore */
+      }
+      sharedRuntime = null;
+      sharedConfigKey = null;
     };
+    proc.once('exit', onExit);
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      // Died between the listen line and the listener — the event is gone.
+      try {
+        runtime.streamRelease();
+      } catch {
+        /* ignore */
+      }
+      throw new Error(`OpenCode server exited during startup (code=${String(proc.exitCode)})`);
+    }
+
+    sharedRuntime = runtime;
     sharedConfigKey = key;
-    sharedInit = null;
-    return sharedRuntime;
+    return runtime;
   })();
 
-  return sharedInit;
+  sharedInit = init;
+  const release = (): void => {
+    if (sharedInit === init) sharedInit = null;
+  };
+  init.then(release, release);
+  return init;
 }
 
 export function destroySharedRuntime(): void {
@@ -480,12 +505,16 @@ export function destroySharedRuntime(): void {
   sharedInit = null;
 }
 
-function sessionErrorMessage(props: { error?: unknown }): string {
-  const err = props.error as { data?: { message?: string } } | undefined;
-  if (err && typeof err === 'object' && err.data && typeof err.data.message === 'string') {
-    return err.data.message;
+/**
+ * The shared runtime's event stream died under a turn (SSE ended or threw).
+ * Only the shared runtime is dropped, and only if `rt` is still it — a
+ * test-injected handle or a runtime that was already replaced is untouched.
+ */
+function discardDeadSharedRuntime(rt: unknown): void {
+  if (sharedRuntime && rt === sharedRuntime) {
+    log('OpenCode event stream died; dropping shared runtime so the next turn respawns it');
+    destroySharedRuntime();
   }
-  return JSON.stringify(props.error) || 'OpenCode session error';
 }
 
 // Steers the model rather than just silently declining: nothing in this
@@ -495,181 +524,6 @@ function sessionErrorMessage(props: { error?: unknown }): string {
 // the chat channel instead of OpenCode's headless-dead-end question tool.
 export const QUESTION_STEERING_TEXT =
   'Interactive questions are not available in this environment. Decide autonomously based on your best judgment, or use the ask_user_question MCP tool to ask the human through the chat channel.';
-
-/**
- * Routing-discipline reminder injected on the first prompt AFTER OpenCode
- * auto-compacts the active session. Compaction rewrites the transcript into a
- * summary, and the delivery contract — every reply that should reach a human
- * must be wrapped in <message to="name">…</message> blocks, which the poll-loop
- * enforces when it dispatches the agent's final text — is exactly the kind of
- * standing instruction a summary can quietly drop. Once it is gone, replies
- * stop reaching anyone. Re-state it, with the live destination list, so the
- * next turn routes correctly.
- *
- * OpenCode 1.4.11 (the pinned SDK) exposes no compaction-prompt /
- * customInstructions API — the Config type has no such key and session
- * summarization takes only providerID + modelID — so unlike the Claude
- * provider's PreCompact hook we cannot steer the summary itself. We re-inject
- * on the next prompt instead. Destinations are read fresh at injection time.
- *
- * NB: on this providers branch there is no shared buildCompactInstructions()
- * helper to reuse (it and the task-series model it depends on land far ahead on
- * main), so this reminder states the branch's own <message to> discipline
- * rather than importing text that does not exist here.
- */
-export function buildPostCompactionReminder(names: string[] = getAllDestinations().map((d) => d.name)): string {
-  const list = names.length > 0 ? names.map((n) => `\`${n}\``).join(', ') : '(none)';
-  return (
-    '<system>The conversation was just compacted into a summary. Routing instructions can be lost in ' +
-    'that summary, so as a reminder: wrap every reply you want delivered in ' +
-    '<message to="name">…</message> blocks — text outside such blocks is treated as scratchpad and is ' +
-    `NOT sent. Available destinations: ${list}.</system>`
-  );
-}
-
-/**
- * Per-query compaction-reminder latch. `note` arms it when a
- * `session.compacted` event names the turn's active session — the OpenCode
- * server is shared across sessions, so an unrelated session's compaction must
- * never arm this query's reminder. `apply` prepends the reminder to the next
- * prompt exactly once, then disarms. `buildReminder` is injectable so tests can
- * drive the latch without touching the destinations DB.
- */
-export function createCompactionReminder(buildReminder: () => string = buildPostCompactionReminder): {
-  note(eventSessionId: string | undefined, activeSessionId: string | undefined): void;
-  apply(message: string): string;
-  readonly isArmed: boolean;
-} {
-  let armed = false;
-  return {
-    note(eventSessionId, activeSessionId) {
-      if (activeSessionId !== undefined && eventSessionId === activeSessionId) armed = true;
-    },
-    apply(message) {
-      if (!armed) return message;
-      armed = false;
-      return `${buildReminder()}\n\n${message}`;
-    },
-    get isArmed() {
-      return armed;
-    },
-  };
-}
-
-/**
- * Structural mirror of the runner's `MemorySessionHookRegistration`
- * (`container/agent-runner/src/memory/session-hook.ts`). Declared locally for
- * the same reason `codex-app-server.ts` declares `CodexMemorySessionHook`: this
- * providers branch carries no `src/memory/*`, so importing the real type would
- * not compile here, while a structural copy still satisfies the interface once
- * this payload is installed onto a main-based tree. The command is referenced
- * by string and executed as a subprocess — never imported — so the rendering
- * and the 16k/file caps stay inside the shared hook.
- */
-export interface OpenCodeMemorySessionHook {
-  readonly command: string;
-  readonly legacyCommands: readonly string[];
-  readonly sources: readonly string[];
-}
-
-/**
- * The two lifecycle points at which this provider establishes a new context
- * window. `clear` never appears: OpenCode has no in-session clear — a cleared
- * conversation arrives as a fresh session, i.e. `startup`. `resume` never
- * appears either, by contract: memory is not re-injected when an existing
- * session continues.
- */
-export type OpenCodeMemorySource = 'startup' | 'compact';
-
-/** Matches the `timeout: 10` (seconds) the Claude provider registers for the same command. */
-const MEMORY_HOOK_TIMEOUT_MS = 10_000;
-
-/**
- * Run the registered memory session hook and return what it printed.
- *
- * The hook reads a Claude-style SessionStart payload on stdin and prints the
- * rendered memory section on stdout (`src/memory/hook.ts`), which is where the
- * per-file caps and the "resume gets nothing" rule live. Nothing is capped or
- * rewritten here — whatever the command prints is what gets injected.
- *
- * Fails closed on every failure mode (unregistered, source the registration
- * does not declare, missing command, non-zero exit, timeout, empty stdout):
- * one log line, no injection, never a thrown turn.
- */
-export function runMemorySessionHook(
-  hook: OpenCodeMemorySessionHook | undefined,
-  source: OpenCodeMemorySource,
-): string | undefined {
-  if (!hook) {
-    log(`No memory session hook registered; skipping ${source} memory injection`);
-    return undefined;
-  }
-  if (!hook.sources.includes(source)) {
-    log(`Memory session hook does not declare source ${source}; skipping injection`);
-    return undefined;
-  }
-
-  try {
-    const res = spawnSync(hook.command, {
-      shell: true,
-      input: JSON.stringify({ hook_event_name: 'SessionStart', source }),
-      encoding: 'utf-8',
-      timeout: MEMORY_HOOK_TIMEOUT_MS,
-    });
-    if (res.error || res.status !== 0) {
-      const why = res.error ? res.error.message : `exit ${String(res.status)}`;
-      log(`Memory session hook (${source}) failed (${why}); continuing without memory`);
-      return undefined;
-    }
-    const out = (res.stdout ?? '').trim();
-    if (!out) {
-      log(`Memory session hook (${source}) produced no output; continuing without memory`);
-      return undefined;
-    }
-    return out;
-  } catch (err) {
-    log(`Memory session hook (${source}) failed: ${err instanceof Error ? err.message : String(err)}`);
-    return undefined;
-  }
-}
-
-/**
- * Per-query memory lifecycle. One instance per `query()`, mirroring
- * createCompactionReminder, so nothing leaks between queries.
- *
- * `openingInstructions` covers the new-context case: an opening query with no
- * continuation is a brand-new OpenCode session (a fresh container and a cleared
- * conversation both land here), so memory joins the system instructions that
- * prompt already carries — exactly one memory block per context window, since
- * follow-up pushes re-send the plain instructions. A query that resumes a
- * continuation passes the instructions through untouched and never runs the
- * command at all.
- *
- * `pushPrefix` covers the other place a context window is rebuilt: OpenCode
- * auto-compaction. The caller passes the compaction latch's armed state, so
- * memory rides the same exactly-once next-prompt slot as the routing reminder.
- */
-export function createMemoryLifecycle(
-  hook: OpenCodeMemorySessionHook | undefined,
-  isResume: boolean,
-): {
-  openingInstructions(systemInstructions?: string): string | undefined;
-  pushPrefix(justCompacted: boolean): string;
-} {
-  return {
-    openingInstructions(systemInstructions) {
-      if (isResume) return systemInstructions;
-      const memory = runMemorySessionHook(hook, 'startup');
-      if (!memory) return systemInstructions;
-      return systemInstructions ? `${memory}\n\n${systemInstructions}` : memory;
-    },
-    pushPrefix(justCompacted) {
-      if (!justCompacted) return '';
-      const memory = runMemorySessionHook(hook, 'compact');
-      return memory ? `${memory}\n\n` : '';
-    },
-  };
-}
 
 /**
  * Minimal shape of the `/v2` SDK surface this module needs for question
@@ -689,10 +543,7 @@ export interface QuestionClient {
  */
 export interface OpenCodeRuntimeHandle {
   client: {
-    session: {
-      create(): Promise<{ data?: { id?: string }; error?: unknown }>;
-      promptAsync(params: { path: { id: string }; body: { parts: unknown[] } }): Promise<{ error?: unknown }>;
-    };
+    session: OpenCodeSessionClient;
     postSessionIdPermissionsPermissionId?(params: {
       path: { id: string; permissionID: string };
       body: { response: string };
@@ -700,10 +551,12 @@ export interface OpenCodeRuntimeHandle {
   };
   stream: AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
   questionClient: QuestionClient;
+  /** Ends the event stream, waking any parked `stream.next()`. */
+  streamRelease?(): void;
 }
 
 export interface OpenCodeRuntimeDeps {
-  getRuntime(options: ProviderOptions): Promise<OpenCodeRuntimeHandle>;
+  getRuntime(options: ProviderOptions, cwd: string): Promise<OpenCodeRuntimeHandle>;
 }
 
 /**
@@ -742,6 +595,21 @@ export async function autoAnswerQuestion(
  */
 const DRAIN_PENDING_QUESTIONS_TIMEOUT_MS = 10_000;
 
+async function waitForQuestionResponse(operation: Promise<void>, timeoutMs: number, context: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<true>((resolve) => {
+    timer = setTimeout(() => resolve(true), timeoutMs);
+  });
+
+  try {
+    if (await Promise.race([operation.then(() => false as const), timedOut])) {
+      log(`Timed out after ${timeoutMs}ms ${context}`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Handle a `question.asked` SSE event: always answer it, regardless of which
  * session raised it. The `question: 'deny'` config above should stop this
@@ -754,12 +622,10 @@ const DRAIN_PENDING_QUESTIONS_TIMEOUT_MS = 10_000;
  * `drainPendingQuestions`, so behavior does not depend on which path sees a
  * question first.
  *
- * Bounded the same way `drainPendingQuestions` bounds its own await: this is
- * called inline from the turn's event loop (the `question.asked` case
- * below), so a `reply()` that never resolves would stall the turn, not just
- * startup. `timeoutMs` is injectable so tests don't wait out the real
- * default; on timeout this logs one line and returns, fail-open, same as the
- * drain path.
+ * The event pump starts this handler without awaiting it, so a hung reply
+ * cannot block event consumption. A bounded wait still reports a stalled
+ * question and releases this handler. On timeout it logs and returns,
+ * fail-open, like the startup drain. Tests can inject a shorter budget.
  */
 export async function handleQuestionAsked(
   questionClient: QuestionClient,
@@ -768,18 +634,11 @@ export async function handleQuestionAsked(
 ): Promise<void> {
   log(`Auto-answering question ${req.id ?? '(no id)'} (sessionID=${req.sessionID ?? 'unknown'})`);
 
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = new Promise<true>((resolve) => {
-    timer = setTimeout(() => resolve(true), timeoutMs);
-  });
-
-  try {
-    if (await Promise.race([autoAnswerQuestion(questionClient, req).then(() => false as const), timedOut])) {
-      log(`Timed out after ${timeoutMs}ms auto-answering question ${req.id ?? '(no id)'}; continuing`);
-    }
-  } finally {
-    clearTimeout(timer);
-  }
+  await waitForQuestionResponse(
+    autoAnswerQuestion(questionClient, req),
+    timeoutMs,
+    `auto-answering question ${req.id ?? '(no id)'}; continuing`,
+  );
 }
 
 /**
@@ -815,372 +674,154 @@ export async function drainPendingQuestions(
     }
   })();
 
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = new Promise<true>((resolve) => {
-    timer = setTimeout(() => resolve(true), timeoutMs);
-  });
+  await waitForQuestionResponse(drain, timeoutMs, 'draining pending questions; continuing startup');
+}
 
-  try {
-    if (await Promise.race([drain.then(() => false as const), timedOut])) {
-      log(`Timed out after ${timeoutMs}ms draining pending questions; continuing startup`);
-    }
-  } finally {
-    // A fast drain resolves before the timer fires, but the timer stays live
-    // until it does — clear it here so it can't hold this call alive or fire
-    // spuriously into a `timedOut` promise no one is racing against anymore.
-    clearTimeout(timer);
+const runtimePumps = new WeakMap<OpenCodeRuntimeHandle, OpenCodeEventPump>();
+
+function eventPump(runtime: OpenCodeRuntimeHandle): OpenCodeEventPump {
+  let pump = runtimePumps.get(runtime);
+  if (!pump) {
+    pump = new OpenCodeEventPump(runtime.stream, (event) => {
+      if (event.type === 'question.asked') {
+        void handleQuestionAsked(runtime.questionClient, event.properties);
+      }
+      if (event.type === 'permission.updated') {
+        const permission = event.properties as { id?: string; sessionID?: string };
+        if (permission.id && permission.sessionID) {
+          void boundedOpenCodeCall(
+            () =>
+              runtime.client.postSessionIdPermissionsPermissionId?.({
+                path: { id: permission.sessionID!, permissionID: permission.id! },
+                body: { response: 'always' },
+              }) ?? Promise.resolve(),
+          ).catch(() => log('Failed to auto-reply OpenCode permission'));
+        }
+      }
+    });
+    runtimePumps.set(runtime, pump);
   }
+  return pump;
 }
 
 export class OpenCodeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
-
-  private readonly options: ProviderOptions;
-  private readonly runtime?: OpenCodeRuntimeDeps;
-  private activeSessionId: string | undefined;
   private memorySessionHook?: OpenCodeMemorySessionHook;
 
-  constructor(options: ProviderOptions = {}, runtime?: OpenCodeRuntimeDeps) {
-    this.options = options;
-    this.runtime = runtime;
+  constructor(
+    private readonly options: ProviderOptions = {},
+    private readonly runtime?: OpenCodeRuntimeDeps,
+    private readonly configuration?: ResolvedRuntimeConfiguration,
+  ) {}
+
+  registerMemorySessionHook(hook: OpenCodeMemorySessionHook, configuration?: unknown): void {
+    this.memorySessionHook = (configuration ?? hook) as OpenCodeMemorySessionHook;
   }
 
-  // OpenCode has no native session-start hook mechanism to hand the command to
-  // (as the Claude Agent SDK's settings.json and Codex's hooks.json have), so
-  // the provider stores the registration and runs the command itself at the
-  // lifecycle points OpenCode does expose — see createMemoryLifecycle.
-  registerMemorySessionHook(hook: OpenCodeMemorySessionHook): void {
-    this.memorySessionHook = hook;
-  }
-
-  isSessionInvalid(err: unknown): boolean {
-    const msg = err instanceof Error ? err.message : String(err);
-    return STALE_SESSION_RE.test(msg);
+  isSessionInvalid(error: unknown): boolean {
+    return STALE_SESSION_RE.test(error instanceof Error ? error.message : String(error));
   }
 
   query(input: QueryInput): AgentQuery {
-    // Newer trunk registers a shared memory session hook before polling. This
-    // install's agent-runner core predates that memory subsystem, so no hook is
-    // registered here. Group memory still reaches the agent via the composed
-    // system prompt (CLAUDE.md / CLAUDE.local.md in systemContext.instructions),
-    // exactly as the Claude provider delivers it on this install — so proceed
-    // without the extra hook-based injection instead of refusing to run.
-    if (!this.memorySessionHook) {
-      log('OpenCode memory session hook not registered — proceeding without hook-based memory injection');
-    }
-
-    if (input.continuation) {
-      this.activeSessionId = input.continuation;
-    } else {
-      this.activeSessionId = undefined;
-    }
-
-    const pending: Array<{
-      text: string;
-      attachments?: OpenCodePromptAttachment[];
-      // The unwrapped prompt, set only on an opening turn that resumed a
-      // persisted continuation. Its presence is what licenses the empty-resume
-      // fallback; its value is what the replay re-composes from, so the
-      // replacement session gets the same prompt shape a first-time session
-      // would have got instead of a second <system> block stacked on the first.
-      replayPrompt?: string;
-    }> = [];
-    let waiting: (() => void) | null = null;
+    if (!this.memorySessionHook) throw new Error('OpenCode memory session hook was not registered');
+    const pending: Array<{ text: string; attachments?: OpenCodePromptAttachment[] }> = [
+      {
+        text: input.prompt,
+        attachments: (input as QueryInput & { attachments?: OpenCodePromptAttachment[] }).attachments,
+      },
+    ];
+    let waiting: (() => void) | undefined;
     let ended = false;
-    let aborted = false;
-    // Latch that re-injects the routing reminder on the next prompt after the
-    // active session auto-compacts (see createCompactionReminder). Per-query so
-    // it never leaks a pending reminder across independent query() calls.
-    const compaction = createCompactionReminder();
-    // Memory rides the same two moments a context window is (re)built: this
-    // opening prompt when it starts a new session, and the first prompt after
-    // a compaction. Never on a resume, never on an ordinary push.
-    const memory = createMemoryLifecycle(this.memorySessionHook, Boolean(input.continuation));
-
-    const systemInstructions = input.systemContext?.instructions;
-    // Read structurally rather than off `QueryInput` directly: an agent-runner
-    // that does not carry the attachment field still type-checks here, and
-    // yields `undefined` — the same no-op as a turn that arrived without media.
-    const openingAttachments = (input as QueryInput & { attachments?: OpenCodePromptAttachment[] }).attachments;
-    pending.push({
-      text: wrapPromptWithContext(input.prompt, memory.openingInstructions(systemInstructions)),
-      attachments: openingAttachments,
-      replayPrompt: input.continuation ? input.prompt : undefined,
-    });
-
-    const kick = (): void => {
-      waiting?.();
-    };
-
+    const abort = new AbortController();
     const self = this;
-    const IDLE_TIMEOUT_MS = Number(process.env.OPENCODE_IDLE_TIMEOUT_MS) || 300_000;
-    let emptyResumeFellBack = false;
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
-      let initYielded = false;
-      const rt = self.runtime ? await self.runtime.getRuntime(self.options) : await ensureSharedRuntime(self.options);
-      const { client, stream, questionClient } = rt;
-
-      while (!aborted) {
-        while (pending.length === 0 && !ended && !aborted) {
-          await new Promise<void>((resolve) => {
-            waiting = resolve;
+      let sessionId = input.continuation;
+      let initialized = false;
+      try {
+        const runtime = self.runtime
+          ? await self.runtime.getRuntime(self.options, input.cwd)
+          : await ensureSharedRuntime(self.options, input.cwd, self.configuration);
+        const pump = eventPump(runtime);
+        const promptModel = resolveOpenCodePromptModel(
+          (self.configuration?.inference ?? resolveOpenCodeInference(self.options, process.env)) as Record<
+            string,
+            unknown
+          >,
+        );
+        while (!abort.signal.aborted) {
+          while (!pending.length && !ended && !abort.signal.aborted) {
+            await new Promise<void>((resolve) => {
+              waiting = resolve;
+            });
+            waiting = undefined;
+          }
+          if (abort.signal.aborted || (!pending.length && ended)) return;
+          const turn = pending.shift()!;
+          if (!sessionId) {
+            const created = await boundedOpenCodeCall(
+              (signal) => runtime.client.session.create({ signal }),
+              abort.signal,
+            );
+            if (created.error) throw new Error(`OpenCode failed to create session: ${JSON.stringify(created.error)}`);
+            sessionId = created.data?.id;
+            if (!sessionId) throw new Error('OpenCode failed to create session (no id)');
+          }
+          if (!initialized) {
+            initialized = true;
+            yield { type: 'init', continuation: sessionId };
+          }
+          const result = yield* executeOpenCodeTurn({
+            runtime,
+            client: runtime.client.session,
+            pump,
+            sessionId,
+            parts: buildPromptParts(turn.text, turn.attachments),
+            model: promptModel,
+            prepare: async () => {
+              await prepareOpenCodeMemory(
+                self.memorySessionHook!,
+                input.systemContext?.instructions,
+                buildDeliverySentences(
+                  getAllDestinations().map((destination) => destination.name),
+                  getTaskSeriesId(),
+                ).join(' '),
+              );
+            },
+            signal: abort.signal,
+            silenceMs: positiveIntegerEnv('OPENCODE_STREAM_SILENCE_MS', DEFAULT_STREAM_SILENCE_MS),
+            idleMs: positiveIntegerEnv('OPENCODE_IDLE_TIMEOUT_MS', DEFAULT_IDLE_TIMEOUT_MS),
+            discard: () => {
+              discardDeadSharedRuntime(runtime);
+              runtime.streamRelease?.();
+            },
           });
-          waiting = null;
+          if (!abort.signal.aborted) yield { type: 'result', ...result };
         }
-
-        if (aborted) return;
-        if (pending.length === 0 && ended) return;
-
-        const { text, attachments, replayPrompt } = pending.shift()!;
-        let sessionId = self.activeSessionId;
-
-        if (!sessionId) {
-          const created = await client.session.create();
-          if (created.error) {
-            throw new Error(`OpenCode: failed to create session: ${JSON.stringify(created.error)}`);
-          }
-          sessionId = created.data?.id;
-          if (!sessionId) throw new Error('OpenCode: failed to create session (no id)');
-          self.activeSessionId = sessionId;
-        }
-
-        if (!initYielded) {
-          yield { type: 'init', continuation: sessionId };
-          initYielded = true;
-        }
-
-        async function* runTurn(
-          turnSessionId: string,
-          turnText: string,
-          turnAttachments: typeof attachments,
-        ): AsyncGenerator<ProviderEvent, { resultText: string; sawAssistantWork: boolean }> {
-          const promptRes = await client.session.promptAsync({
-            path: { id: turnSessionId },
-            body: { parts: buildPromptParts(turnText, turnAttachments) },
-          });
-          if (promptRes.error) {
-            self.activeSessionId = undefined;
-            throw new Error(`OpenCode promptAsync: ${JSON.stringify(promptRes.error)}`);
-          }
-
-          const partTextByMessageId = new Map<string, string>();
-          const roleByMessageId = new Map<string, string>();
-          const partMessageIds = new Set<string>();
-          const erroredMessageIds = new Set<string>();
-          // Set only by signals that have no message record of their own
-          // (permissions, questions, compaction). Message-derived work is
-          // decided once, after the turn, in the loop below.
-          let sawAssistantWork = false;
-          let lastEventAt = Date.now();
-          let eventTimedOut = false;
-          const timeoutCheck = setInterval(() => {
-            if (Date.now() - lastEventAt > IDLE_TIMEOUT_MS) {
-              log(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms) — clearing session ${turnSessionId}`);
-              eventTimedOut = true;
-              self.activeSessionId = undefined;
-              destroySharedRuntime();
-              kick();
-            }
-          }, 5000);
-
-          try {
-            turn: while (true) {
-              if (aborted) return { resultText: '', sawAssistantWork };
-              if (eventTimedOut) {
-                throw new Error(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms)`);
-              }
-
-              const { value: ev, done } = await stream.next();
-              if (done) {
-                throw new Error('OpenCode SSE stream ended unexpectedly');
-              }
-
-              if (!ev?.type || ev.type === 'server.connected' || ev.type === 'server.heartbeat') continue;
-
-              lastEventAt = Date.now();
-              yield { type: 'activity' };
-
-              switch (ev.type) {
-                case 'message.updated': {
-                  const info = ev.properties.info as
-                    | { id?: string; role?: string; sessionID?: string; error?: unknown }
-                    | undefined;
-                  if (info?.sessionID && info.sessionID !== turnSessionId) break;
-                  if (info?.id && info?.role) {
-                    roleByMessageId.set(info.id, info.role);
-                    // `message.updated` fires repeatedly for the same record, so
-                    // latch the error rather than reading the last event only.
-                    if (info.error) erroredMessageIds.add(info.id);
-                  }
-                  break;
-                }
-                case 'message.part.updated': {
-                  const part = ev.properties.part as
-                    | { type?: string; messageID?: string; sessionID?: string; text?: string }
-                    | undefined;
-                  if (part?.sessionID && part.sessionID !== turnSessionId) break;
-                  if (part?.messageID) {
-                    partMessageIds.add(part.messageID);
-                    if (part.type === 'text' && part.text) {
-                      partTextByMessageId.set(part.messageID, part.text);
-                    }
-                  }
-                  break;
-                }
-                case 'permission.updated': {
-                  const perm = ev.properties as { id?: string; sessionID?: string };
-                  if (perm.sessionID === turnSessionId && perm.id) {
-                    sawAssistantWork = true;
-                    try {
-                      await client.postSessionIdPermissionsPermissionId?.({
-                        path: { id: turnSessionId, permissionID: perm.id },
-                        body: { response: 'always' },
-                      });
-                    } catch (err) {
-                      log(`Failed to auto-reply permission: ${err instanceof Error ? err.message : String(err)}`);
-                    }
-                  }
-                  break;
-                }
-                case 'question.asked': {
-                  const req = ev.properties as { id?: string; sessionID?: string; questions?: unknown[] };
-                  if (req.sessionID === turnSessionId) sawAssistantWork = true;
-                  await handleQuestionAsked(questionClient, req);
-                  break;
-                }
-                case 'session.status': {
-                  const props = ev.properties as {
-                    sessionID?: string;
-                    status?: { type?: string; attempt?: number; message?: string };
-                  };
-                  if (props.sessionID !== turnSessionId) break;
-                  const st = props.status;
-                  if (
-                    st?.type === 'retry' &&
-                    typeof st.attempt === 'number' &&
-                    st.attempt >= SESSION_STATUS_RETRY_ERROR_AFTER &&
-                    st.message
-                  ) {
-                    self.activeSessionId = undefined;
-                    throw new Error(`OpenCode retry limit (${st.attempt}): ${st.message}`);
-                  }
-                  break;
-                }
-                case 'session.error': {
-                  const props = ev.properties as { sessionID?: string; error?: unknown };
-                  if (props.sessionID === turnSessionId || props.sessionID === undefined) {
-                    self.activeSessionId = undefined;
-                    throw new Error(sessionErrorMessage(props));
-                  }
-                  break;
-                }
-                case 'session.compacted': {
-                  // The active session was just auto-compacted; arm the routing
-                  // reminder for the next prompt. Filter by sessionID like the
-                  // other cases — the shared server emits this for every session.
-                  const sid = (ev.properties as { sessionID?: string }).sessionID;
-                  compaction.note(sid, turnSessionId);
-                  if (sid === turnSessionId) sawAssistantWork = true;
-                  break;
-                }
-                case 'session.idle': {
-                  const sid = (ev.properties as { sessionID?: string }).sessionID;
-                  if (sid === turnSessionId) {
-                    break turn;
-                  }
-                  break;
-                }
-                default:
-                  break;
-              }
-            }
-          } finally {
-            clearInterval(timeoutCheck);
-          }
-
-          let resultText = '';
-          for (const [msgId, role] of roleByMessageId) {
-            if (role !== 'assistant') continue;
-            // The bare envelope is the quiet-idle signature. OpenCode opens the
-            // assistant record when the turn starts (`AssistantMessage.time` has
-            // a required `created` and an optional `completed`), so the record
-            // existing proves nothing on its own. Work means it produced at
-            // least one part — or that it carries a provider error, which marks
-            // a live session whose turn failed: replaying that on a fresh
-            // session would discard the history and bury the error.
-            if (partMessageIds.has(msgId) || erroredMessageIds.has(msgId)) {
-              sawAssistantWork = true;
-            }
-            resultText = partTextByMessageId.get(msgId) ?? resultText;
-          }
-          return { resultText, sawAssistantWork };
-        }
-
-        let outcome = yield* runTurn(sessionId, text, attachments);
-        if (aborted) return;
-
-        if (
-          isEmptyOpenCodeResume({
-            resumedExistingSession: replayPrompt !== undefined,
-            alreadyFellBack: emptyResumeFellBack,
-            sawAssistantWork: outcome.sawAssistantWork,
-          })
-        ) {
-          log(`Empty resume on ${sessionId}; starting fresh session.`);
-          emptyResumeFellBack = true;
-          self.activeSessionId = undefined;
-          const created = await client.session.create();
-          if (aborted) return;
-          if (created.error) {
-            throw new Error(`OpenCode: failed to create session: ${JSON.stringify(created.error)}`);
-          }
-          const freshId = created.data?.id;
-          if (!freshId) throw new Error('OpenCode: failed to create session (no id)');
-          sessionId = freshId;
-          self.activeSessionId = freshId;
-          yield { type: 'init', continuation: freshId };
-          initYielded = true;
-          // Compose the replay the way a first-time query composes an opening
-          // prompt — one <system> block carrying memory and the instructions —
-          // rather than wrapping the already-wrapped resume text a second time.
-          // `replayPrompt` is defined here: it is what licensed this branch.
-          const freshMemory = createMemoryLifecycle(self.memorySessionHook, false);
-          const retryText = wrapPromptWithContext(replayPrompt!, freshMemory.openingInstructions(systemInstructions));
-          outcome = yield* runTurn(freshId, retryText, attachments);
-          if (aborted) return;
-        }
-
-        yield { type: 'result', text: outcome.resultText || null };
+      } catch (error) {
+        if (!abort.signal.aborted) throw error;
+      } finally {
+        abort.abort();
       }
     }
 
     return {
-      push: (message: string, attachments?: OpenCodePromptAttachment[]) => {
-        // If the active session compacted mid-conversation, memory and the
-        // routing reminder both ride this next prompt (once each), then the
-        // latch disarms. Read the latch BEFORE apply() consumes it. Order is
-        // memory, then reminder, then the user's text.
-        const justCompacted = compaction.isArmed;
-        pending.push({
-          text: wrapPromptWithContext(memory.pushPrefix(justCompacted) + compaction.apply(message), systemInstructions),
-          attachments,
-        });
-        kick();
+      push: (text: string, attachments?: OpenCodePromptAttachment[]) => {
+        if (ended || abort.signal.aborted) return;
+        pending.push({ text, attachments });
+        waiting?.();
       },
       end: () => {
         ended = true;
-        kick();
+        waiting?.();
       },
       events: gen(),
       abort: () => {
-        aborted = true;
-        this.activeSessionId = undefined;
-        kick();
-        destroySharedRuntime();
+        abort.abort();
+        waiting?.();
       },
     };
   }
 }
 
-registerProvider('opencode', (opts) => new OpenCodeProvider(opts));
+registerProvider('opencode', (opts, configuration) => new OpenCodeProvider(opts, undefined, configuration));

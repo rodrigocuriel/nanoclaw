@@ -24,6 +24,7 @@ import {
   attachCodexAutoApproval,
   codexInferenceSection,
   codexRuntimeOwnership,
+  codexTone,
   initializeCodexAppServer,
   interruptCodexTurn,
   killCodexAppServer,
@@ -34,7 +35,7 @@ import {
   writeCodexConfigToml,
 } from './codex-app-server.js';
 
-import { createTurnWatchdog } from './turn-watchdog.js';
+const TURN_TIMEOUT_MS = 10 * 60 * 1000;
 
 export interface CodexRuntimeDeps {
   writeCodexConfigToml: typeof writeCodexConfigToml;
@@ -58,6 +59,7 @@ export interface CodexResolvedConfiguration {
   executionPolicy?: unknown;
   inference?: unknown;
   mcpServers?: unknown;
+  tone?: unknown;
 }
 
 /**
@@ -104,6 +106,7 @@ export class CodexProvider implements AgentProvider {
 
   private readonly mcpServers: Record<string, McpServerConfig>;
   private readonly inference: CodexConfigPlan['inference'];
+  private readonly tone: ReturnType<typeof codexTone.toSettings>;
   private readonly runtime: CodexRuntimeDeps;
   private memorySessionHook?: CodexMemorySessionHook;
 
@@ -119,6 +122,7 @@ export class CodexProvider implements AgentProvider {
     configuration?: CodexResolvedConfiguration,
   ) {
     this.runtime = runtime;
+    this.tone = (configuration?.tone as typeof this.tone | undefined) ?? codexTone.toSettings(codexTone.default);
     if (configuration) {
       this.inference = configuration.inference as CodexConfigPlan['inference'];
       this.mcpServers = configuration.mcpServers as Record<string, McpServerConfig>;
@@ -141,11 +145,7 @@ export class CodexProvider implements AgentProvider {
   }
 
   query(input: QueryInput): AgentQuery {
-    // This install's runner core predates the memory subsystem, so no hook is
-    // registered. Group memory still reaches the agent via the composed AGENTS.md
-    // (providesAgentSurfaces), same as the Claude/OpenCode providers here — so
-    // proceed without hook-based injection instead of refusing to run.
-    if (!this.memorySessionHook) console.error('Codex memory session hook not registered — proceeding without hook-based memory injection');
+    if (!this.memorySessionHook) throw new Error('Codex memory session hook was not registered');
     const memorySessionHook = this.memorySessionHook;
     const pending: string[] = [input.prompt];
     let waiting: (() => void) | null = null;
@@ -193,6 +193,7 @@ export class CodexProvider implements AgentProvider {
         await self.runtime.initializeCodexAppServer(server);
         threadId = await self.runtime.startOrResumeCodexThread(server, threadId, {
           model: self.inference.model,
+          ...self.tone,
           cwd: input.cwd,
           baseInstructions: input.systemContext?.instructions,
         });
@@ -287,7 +288,6 @@ async function* runOneTurn(
   // pushOrSteer queues any racing follow-up into a fresh turn instead.
   const finishTurn = (): void => {
     turnDone = true;
-    watchdog.stop();
     clearActiveTurn();
   };
 
@@ -299,16 +299,9 @@ async function* runOneTurn(
   };
   setAbortWaker(kick);
 
-  const watchdog = createTurnWatchdog((reason) => {
-    state.error = new Error(reason);
-    finishTurn();
-    kick();
-  });
-
   const handler = (n: JsonRpcNotification): void => {
     const method = n.method;
     const params = n.params ?? {};
-    watchdog.touch();
     buffer.push({ type: 'activity' });
 
     switch (method) {
@@ -346,12 +339,6 @@ async function* runOneTurn(
       case 'error': {
         const err = params.error as { message?: string; additionalDetails?: string | null } | undefined;
         const msg = [err?.message, err?.additionalDetails].filter(Boolean).join(': ') || 'Codex turn failed';
-        // Codex owns transport retries; keep the turn alive until recovery or
-        // a terminal error instead of killing the app-server mid-reconnect.
-        if (params.willRetry === true) {
-          buffer.push({ type: 'progress', message: msg });
-          break;
-        }
         state.error = new Error(msg);
         finishTurn();
         break;
@@ -390,6 +377,12 @@ async function* runOneTurn(
     kick();
   };
   server.exitHandlers.push(onServerExit);
+
+  const timer = setTimeout(() => {
+    state.error = new Error(`Turn timed out after ${TURN_TIMEOUT_MS}ms`);
+    finishTurn();
+    kick();
+  }, TURN_TIMEOUT_MS);
 
   try {
     if (!hasInit()) {
@@ -441,7 +434,7 @@ async function* runOneTurn(
 
     yield { type: 'result', text: resultText || null };
   } finally {
-    watchdog.stop();
+    clearTimeout(timer);
     clearActiveTurn();
     setAbortWaker(null);
     const idx = server.notificationHandlers.indexOf(handler);
