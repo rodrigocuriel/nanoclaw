@@ -363,6 +363,12 @@ export interface ChatSdkBridgeConfig {
    */
   transformOutboundText?: (text: string) => string;
   /**
+   * Retry rejected rich text as raw/plain text when the platform reports a
+   * formatting parse error. The retry is safe because these errors are
+   * returned before the platform creates a message.
+   */
+  fallbackToPlainTextOnFormattingError?: boolean;
+  /**
    * Maximum text length the underlying adapter accepts in a single message.
    * When set, the bridge splits outbound text longer than this on paragraph
    * → line → hard-char boundaries and posts multiple messages. Without this,
@@ -974,10 +980,18 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
-          const result = await adapter.postMessage(
-            tid,
-            attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
-          );
+          const richMessage = attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk };
+          let result;
+          try {
+            result = await adapter.postMessage(tid, richMessage);
+          } catch (err) {
+            if (!config.fallbackToPlainTextOnFormattingError || !isFormattingParseError(err)) throw err;
+            log.warn('Rich-text delivery rejected; retrying as plain text', {
+              adapter: adapter.name,
+              err,
+            });
+            result = await adapter.postMessage(tid, attachFiles ? { raw: chunk, files: fileUploads } : { raw: chunk });
+          }
           if (i === 0) firstId = result?.id;
         }
         return firstId;
@@ -1036,6 +1050,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   }
 
   return bridge;
+}
+
+function isFormattingParseError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /can't parse entities/i.test(message);
 }
 
 /**

@@ -559,6 +559,56 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
   });
 });
 
+describe('createChatSdkBridge.deliver — formatting fallback', () => {
+  it('retries a platform formatting rejection as plain text', async () => {
+    const calls: AdapterPostableMessage[] = [];
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({
+        name: 'telegram',
+        postMessage: async (threadId, message) => {
+          calls.push(message);
+          if (calls.length === 1) {
+            throw new Error("Bad Request: can't parse entities: Can't find end of a URL at byte offset 268");
+          }
+          return { id: 'plain-fallback', threadId, raw: {} };
+        },
+      }),
+      supportsThreads: false,
+      fallbackToPlainTextOnFormattingError: true,
+    });
+
+    const text =
+      'Connect Cloudflare:\n\n' +
+      'https://onecli.curielmedia.com/connections?connect=cloudflare&source=agent&agent_name=Nano';
+    const id = await bridge.deliver('telegram:42', null, {
+      kind: 'chat-sdk',
+      content: { text },
+    });
+
+    expect(id).toBe('plain-fallback');
+    expect(calls).toEqual([{ markdown: text }, { raw: text }]);
+  });
+
+  it('does not retry transport failures as plain text', async () => {
+    const postMessage = vi.fn(async () => {
+      throw new Error('Network error calling Telegram sendMessage');
+    });
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ name: 'telegram', postMessage }),
+      supportsThreads: false,
+      fallbackToPlainTextOnFormattingError: true,
+    });
+
+    await expect(
+      bridge.deliver('telegram:42', null, {
+        kind: 'chat-sdk',
+        content: { text: 'hello' },
+      }),
+    ).rejects.toThrow('Network error');
+    expect(postMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
 it('uses a registered approval presentation losslessly for initial and terminal cards', async () => {
   const { registerQuestionRenderResolver } = await import('./question-render-registry.js');
   const evidence = 'full evidence\n'.repeat(500);

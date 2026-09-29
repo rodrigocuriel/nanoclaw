@@ -391,6 +391,7 @@ export function createTelegramBridge(options: TelegramBridgeOptions = {}): Chann
     // sanitizer this replaced was written for the old converter and, run in
     // front of the new one, downgraded **bold** to *single-star* — which the
     // adapter then parsed as emphasis and rendered as _italic_.
+    fallbackToPlainTextOnFormattingError: true,
     maxTextLength: 4000,
   });
 
