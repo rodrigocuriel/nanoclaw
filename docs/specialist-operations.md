@@ -121,3 +121,18 @@ The vault credential originated from the operator's Mac Codex login imported on 
 - Without `--message`, restart stops the current container and the group resumes on its next message. History remains intact; no failed messages were replayed and no test messages were sent. Idle groups use the updated vault credential when they next wake.
 
 The supplied `/tmp/codex-auth.json` was restricted to `0600` and left in place during this repair; deletion was not performed. No credential values were recorded in these notes.
+
+## Hybrid Codex workspace identity (2026-10-02)
+
+Codex CLI 0.159 introduced local ChatGPT workspace routing discovery. OneCLI's original Codex stub replaced `tokens.account_id` and the synthetic ID token's `chatgpt_account_id` claim with `onecli-managed`. Network authentication still succeeded through the proxy, but Codex stopped before inference with `selected workspace missing from routing discovery` because its local workspace selection could not match the server response.
+
+The OneCLI adapter now builds a hybrid stub at session admission:
+
+1. Read `/v1/agents`, `/v1/secrets`, and the resolved agent's `/v1/agents/<id>/secrets` assignment list using the existing OneCLI management connection.
+2. Select the assigned `openai` credential for `chatgpt.com` whose metadata declares OAuth.
+3. Copy only `metadata.accountId` into `tokens.account_id` and the synthetic ID token's `chatgpt_account_id` claim.
+4. Keep access and refresh tokens as the literal `onecli-managed` sentinel values. The mounted file remains read-only, and the real vault tokens remain outside the agent container.
+
+The adapter rejects malformed account IDs, ambiguous assigned OAuth identities, unexpected stub shapes, and any Codex stub whose access or refresh fields are not OneCLI sentinels. The installed OneCLI skill payload contains the same adapter and tests so a skill refresh preserves the change.
+
+Codex is pinned to 0.159.0. Host build and 78 gateway tests passed locally; the production host build and 16 focused adapter tests also passed. A live terminal turn returned `HYBRID_AUTH_OK`. A live built-in image generation turn downloaded and saved a source PNG plus a 64×64 output PNG, then returned `IMAGE_GEN_OK`. That image turn took about six minutes, longer than `scripts/chat.ts`'s two-minute client timeout; the container continued the turn and wrote the final response to the outbound mailbox.

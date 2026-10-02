@@ -54,7 +54,12 @@ vi.mock('../env.js', () => ({
   }),
 }));
 
-import { contributionFromConfig, withProviderEnv } from './onecli.js';
+import {
+  contributionFromConfig,
+  resolveCodexAccountId,
+  withCodexWorkspaceIdentity,
+  withProviderEnv,
+} from './onecli.js';
 import { getGatewayProviderRegistration } from './gateway-provider-registry.js';
 
 const provider = getGatewayProviderRegistration('onecli')!;
@@ -69,6 +74,39 @@ const input = (sessionId: string): GatewaySessionInput => ({
   capabilities: {} as never,
 });
 
+const ACCOUNT_ID = '22222222-2222-4222-8222-222222222222';
+
+function codexStub(overrides: Record<string, unknown> = {}) {
+  const payload = {
+    sub: 'onecli-managed',
+    email: 'agent@onecli.sh',
+    'https://api.openai.com/auth': {
+      chatgpt_plan_type: 'plus',
+      chatgpt_user_id: 'onecli-managed',
+      chatgpt_account_id: 'onecli-managed',
+    },
+  };
+  const idToken = [
+    Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url'),
+    Buffer.from(JSON.stringify(payload)).toString('base64url'),
+    'synthetic-signature',
+  ].join('.');
+  return {
+    containerPath: '/home/node/.codex/auth.json',
+    content: JSON.stringify({
+      auth_mode: 'chatgpt',
+      OPENAI_API_KEY: null,
+      tokens: {
+        id_token: idToken,
+        access_token: 'onecli-managed',
+        refresh_token: 'onecli-managed',
+        account_id: 'onecli-managed',
+        ...overrides,
+      },
+    }),
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   sdk.manualApproval = undefined;
@@ -80,6 +118,69 @@ afterEach(() => {
 });
 
 describe('OneCLI gateway package', () => {
+  it('adds only the non-secret workspace identity to the synthetic Codex auth stub', () => {
+    const config = {
+      env: {},
+      caCertificate: 'CA',
+      caCertificateContainerPath: '/tmp/ca.pem',
+      credentialStubs: [codexStub()],
+    };
+    const result = withCodexWorkspaceIdentity(config, ACCOUNT_ID);
+    const auth = JSON.parse(result.credentialStubs![0].content);
+    const payload = JSON.parse(Buffer.from(auth.tokens.id_token.split('.')[1], 'base64url').toString('utf8'));
+
+    expect(auth.tokens).toMatchObject({
+      access_token: 'onecli-managed',
+      refresh_token: 'onecli-managed',
+      account_id: ACCOUNT_ID,
+    });
+    expect(payload['https://api.openai.com/auth']).toMatchObject({
+      chatgpt_user_id: 'onecli-managed',
+      chatgpt_account_id: ACCOUNT_ID,
+    });
+    expect(auth.tokens.id_token.split('.')[2]).toBe('synthetic-signature');
+  });
+
+  it('refuses to rewrite a Codex stub that contains non-sentinel credentials', () => {
+    const config = {
+      env: {},
+      caCertificate: 'CA',
+      caCertificateContainerPath: '/tmp/ca.pem',
+      credentialStubs: [codexStub({ access_token: 'real-token' })],
+    };
+    expect(() => withCodexWorkspaceIdentity(config, ACCOUNT_ID)).toThrow('non-sentinel credentials');
+  });
+
+  it('resolves the workspace identity only from the OAuth secret assigned to the agent', async () => {
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const pathname = new URL(String(input)).pathname;
+      if (pathname === '/v1/agents') {
+        return Response.json([{ id: 'agent-1', identifier: 'g1', secretMode: 'selective' }]);
+      }
+      if (pathname === '/v1/agents/agent-1/secrets') return Response.json(['codex-secret']);
+      if (pathname === '/v1/secrets') {
+        return Response.json([
+          {
+            id: 'other-secret',
+            type: 'openai',
+            hostPattern: 'chatgpt.com',
+            metadata: { authMode: 'oauth', accountId: '11111111-1111-4111-8111-111111111111' },
+          },
+          {
+            id: 'codex-secret',
+            type: 'openai',
+            hostPattern: 'chatgpt.com',
+            metadata: { authMode: 'oauth', accountId: ACCOUNT_ID },
+          },
+        ]);
+      }
+      return new Response('', { status: 404 });
+    });
+
+    await expect(resolveCodexAccountId('g1', fetchImpl as typeof fetch)).resolves.toBe(ACCOUNT_ID);
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
   it.each(['copy-a', 'copy-b'])('leaves foreign requests untouched by the real SDK poller: %s', async (owned) => {
     const { ApprovalClient } = await vi.importActual<typeof import('@onecli-sh/sdk')>('@onecli-sh/sdk');
     const controller = new AbortController();
