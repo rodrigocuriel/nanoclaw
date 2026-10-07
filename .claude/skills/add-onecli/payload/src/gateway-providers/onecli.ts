@@ -183,6 +183,12 @@ export function contributionFromConfig(
   dataDir = DATA_DIR,
 ): OneCLIContribution {
   const env = { ...config.env };
+  const mergeNoProxy = (value: string | undefined): string =>
+    [...new Set([...(value ?? '').split(',').map((entry) => entry.trim()).filter(Boolean), 'host.docker.internal'])].join(
+      ',',
+    );
+  env.NO_PROXY = mergeNoProxy(env.NO_PROXY);
+  env.no_proxy = mergeNoProxy(env.no_proxy);
   const mounts: GatewayMount[] = [];
   const mount = (kind: 'ca' | 'combined' | 'stub', content: string, containerPath: string) => {
     mounts.push({
